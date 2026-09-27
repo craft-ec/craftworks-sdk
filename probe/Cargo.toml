@@ -6,6 +6,10 @@ publish = false
 description = "Platform probes against a pinned Freenet: the import gate, and the delegate experiments."
 
 [dependencies]
+# live-tail: the Tail's client side and contract, and a writer key to sign with.
+tail = { path = "../tail" }
+craftec-tail-contract = { workspace = true }
+craftec-register-contract = { workspace = true }
 core-types = { path = "../core-types" }
 # node-forget opens a STOPPED private node's store: freenet-core v0.2.138's own redb (4.2), so the file format matches.
 redb = "=4.2.0"
