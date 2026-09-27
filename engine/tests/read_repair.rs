@@ -641,6 +641,7 @@ fn two_parity_lost_with_every_member_there_are_put_back_byte_for_byte() {
     let lost: BTreeSet<Cid> = parity.iter().take(2).copied().collect();
     let keys = keys_in(&all, &members);
     let (mut e, store) = cold_reader(root, Params::default());
+    e.begin_repair_pass(true); // only a REPAIR PASS puts parity back (sdk#479)
     let mut put: BTreeMap<Cid, Vec<u8>> = BTreeMap::new();
     let mut seen: BTreeSet<Cid> = BTreeSet::new();
     for (n, key) in keys.iter().enumerate() {

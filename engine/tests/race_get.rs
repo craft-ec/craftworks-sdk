@@ -101,7 +101,7 @@ fn read_cold(
     keys: &[Vec<u8>],
     params: Params,
 ) -> Run {
-    read_cold_as(root, all, net, keys, params, false)
+    read_cold_as(root, all, net, keys, params, false, false)
 }
 
 /// `together`: every read is asked before any answer comes (reads in flight at once), instead of one read settled
@@ -113,8 +113,13 @@ fn read_cold_as(
     keys: &[Vec<u8>],
     params: Params,
     together: bool,
+    pass: bool,
 ) -> Run {
     let (mut e, store) = cold_reader(root, params);
+    // A REPAIR PASS (sdk#479): only a pass records lost parity and puts it back.
+    if pass {
+        e.begin_repair_pass(true);
+    }
     let mut answers = BTreeMap::new();
     let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
     let mut forged: BTreeSet<Cid> = BTreeSet::new();
@@ -247,7 +252,7 @@ fn reads_in_flight_together_ask_each_block_of_the_group_once() {
         .iter()
         .map(|m| keys_in(&all, &[*m])[0].clone())
         .collect();
-    let run = read_cold_as(root, &all, &BTreeMap::new(), &keys, Params::default(), true);
+    let run = read_cold_as(root, &all, &BTreeMap::new(), &keys, Params::default(), true, false);
     assert_eq!(run.answers.len(), keys.len(), "not every read was answered");
     assert!(wrong(&run.answers, &records).is_empty());
     let twice: Vec<String> = members
@@ -527,7 +532,8 @@ fn hex(c: &Cid) -> String {
 }
 
 /// **A MISSING PARITY BLOCK IS PUT BACK** (sdk#479; the owner via core dev: a group whose parity is never replaced
-/// erodes to its last copy). The node has lost one parity block of a group; reading the group's keys races the group,
+/// erodes to its last copy). The node has lost one parity block of a group; reading the group's keys IN A REPAIR PASS
+/// races the group,
 /// sees that parity NotFound, and -- once every member is held -- re-encodes it with the save's own code and PUTs it
 /// back, byte for byte the block the save made. THE CONTROL: nothing lost, nothing put back.
 #[test]
@@ -538,7 +544,7 @@ fn a_parity_block_the_reads_find_missing_is_re_encoded_and_put_back_byte_for_byt
     let keys = keys_in(&all, &members);
     let lost = parity[1];
     let net: BTreeMap<Cid, Net> = [(lost, Net::Lost)].into_iter().collect();
-    let run = read_cold(root, &all, &net, &keys, Params::default());
+    let run = read_cold_as(root, &all, &net, &keys, Params::default(), false, true);
     assert!(wrong(&run.answers, &records).is_empty(), "THE SETUP: a read of the group went wrong");
     let original = all.get(&lost).expect("the save made it").to_vec();
     let back: Vec<&(Cid, Vec<u8>)> = run.repaired.iter().filter(|(id, _)| *id == lost).collect();
@@ -546,7 +552,7 @@ fn a_parity_block_the_reads_find_missing_is_re_encoded_and_put_back_byte_for_byt
     assert_eq!(back[0].1, original, "the parity put back is not the block the save made");
     // THE CONTROL: the same reads with the parity on the network. (The fixture puts only THIS node's parity on the
     // network, so other groups' parity is missing in both runs: the difference is this one block.)
-    let clean = read_cold(root, &all, &BTreeMap::new(), &keys, Params::default());
+    let clean = read_cold_as(root, &all, &BTreeMap::new(), &keys, Params::default(), false, true);
     // (A MEMBER may be put back in either run: when `k` of its group answer before it, the race rebuilds it -- main's
     // race get, not this change.)
     assert!(clean.repaired.iter().all(|(id, _)| !parity.contains(id)), "THE CONTROL: a whole group put one of its parity blocks back");

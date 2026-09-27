@@ -122,9 +122,14 @@ impl<B: Blocks> Engine<B> {
                 })
                 .collect();
             let Some(states) = states else { continue };
+            // Its PARITY slot, through the one lookup (`repair::slots_of`: the build fails on a first match). The entry
+            // ends here either way -- and a slot not found is COUNTED (mismatched), never dropped silently (the
+            // architect on #555).
             self.parity_owed.remove(&id);
-            // Its PARITY slot, through the one lookup (`repair::slots_of`: the build fails on a first match).
-            let Some(ix) = g.slots_of(&id).find(|&i| g.is_parity(i)) else { continue };
+            let Some(ix) = g.slots_of(&id).find(|&i| g.is_parity(i)) else {
+                self.parity_counts.2 += 1;
+                continue;
+            };
             let encoded = freenet_prolly::parity::encode_group(&states).ok().and_then(|p| p.into_iter().nth(ix - g.k));
             match encoded {
                 Some(bytes) if block_id(kind::PARITY, &bytes) == id => {

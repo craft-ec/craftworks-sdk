@@ -3388,6 +3388,50 @@ fn an_upgrade_keeps_the_link_and_the_pointer_byte_for_byte() {
     assert_eq!(webs, vec![site_web(&node, APP, 1), site_web(&node, APP, 2)], "an upgrade's site is not its starter and the SAME pointer");
 }
 
+/// A PUBLISHED tree of 2,000 rows on a fresh node, and the node then LOSES every `every`th block of its CURRENT tree
+/// (walked from the head's root in the writer's store: the node also holds superseded heads' blocks, which no read of
+/// this tree asks). The node, the clock, and the lost blocks' contract ids with their states; `blocks`: the current
+/// tree's block count.
+struct Lossy {
+    node: WireNode,
+    now: u64,
+    lost: BTreeMap<[u8; 32], Vec<u8>>,
+    blocks: usize,
+    /// The current tree's blocks, by block id.
+    tree: Vec<freenet_prolly::Cid>,
+}
+
+fn lossy_tree(seed: u8, every: Option<usize>) -> Lossy {
+    let rows = |lo: u32, hi: u32| -> Vec<protocol::Op> { (lo..hi).map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), vec![i as u8; 90])).collect() };
+    let mut node = WireNode::new(&[seed; 32]);
+    let mut now = 1_000;
+    let mut w = page_io(&node);
+    client(&mut w, &mut node, &mut now, &Request::Identity);
+    for (n, lo) in (0..2_000u32).step_by(500).enumerate() {
+        assert!(states(&client(&mut w, &mut node, &mut now, &Request::forced_write(n as u64 + 1, rows(lo, lo + 500))), n as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
+    }
+    let (_, root) = node.head().expect("a head");
+    let mut tree: std::collections::BTreeSet<freenet_prolly::Cid> = std::collections::BTreeSet::from([root]);
+    let mut at = vec![root];
+    while let Some(id) = at.pop() {
+        let bytes = freenet_prolly::store::Blocks::get(w.server.page.blocks(), &id).expect("the writer holds its tree").to_vec();
+        let n = freenet_prolly::node::Node::parse(&bytes).expect("a node");
+        tree.extend(n.parity());
+        for (_, members) in freenet_prolly::parity::group_members(&n) {
+            tree.extend(members.iter().copied());
+        }
+        if !n.is_leaf() {
+            at.extend((0..n.len()).map(|i| n.child(i).0));
+        }
+    }
+    let blocks: Vec<[u8; 32]> = tree.iter().map(|c| wire::block::contract_for(BLOCK_CODE, c)).filter(|id| node.contracts.contains_key(id)).collect();
+    let lost: BTreeMap<[u8; 32], Vec<u8>> = every.map(|e| blocks.iter().step_by(e).map(|id| (*id, node.contracts[id].clone())).collect()).unwrap_or_default();
+    for id in lost.keys() {
+        node.contracts.remove(id);
+    }
+    Lossy { node, now, lost, blocks: blocks.len(), tree: tree.into_iter().collect() }
+}
+
 /// Every row of `io`'s tree, read through the normal read: a full range, page by page (the engine's scan).
 fn read_all(io: &mut PageIo, node: &mut WireNode, now: &mut u64, base: u64) -> usize {
     let (mut rows, mut after, mut n) = (0, None, 0u64);
@@ -3415,44 +3459,16 @@ fn read_all(io: &mut PageIo, node: &mut WireNode, now: &mut u64, base: u64) -> u
 /// put back.
 #[test]
 fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_nothing_missing() {
-    let rows = |lo: u32, hi: u32| -> Vec<protocol::Op> { (lo..hi).map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), vec![i as u8; 90])).collect() };
     for lose in [true, false] {
-        let mut node = WireNode::new(&[41u8; 32]);
-        let mut now = 1_000;
-        let mut w = page_io(&node);
-        client(&mut w, &mut node, &mut now, &Request::Identity);
-        for (n, lo) in (0..2_000u32).step_by(500).enumerate() {
-            assert!(states(&client(&mut w, &mut node, &mut now, &Request::forced_write(n as u64 + 1, rows(lo, lo + 500))), n as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
-        }
-        // The CURRENT tree's blocks (the node also holds superseded heads' blocks, which no read of this tree asks):
-        // walked from the head's root in the writer's store -- every node, its groups' members and their parity.
-        let (_, root) = node.head().expect("a head");
-        let mut tree: std::collections::BTreeSet<freenet_prolly::Cid> = std::collections::BTreeSet::from([root]);
-        let mut at = vec![root];
-        while let Some(id) = at.pop() {
-            let bytes = freenet_prolly::store::Blocks::get(w.server.page.blocks(), &id).expect("the writer holds its tree").to_vec();
-            let n = freenet_prolly::node::Node::parse(&bytes).expect("a node");
-            tree.extend(n.parity());
-            for (_, members) in freenet_prolly::parity::group_members(&n) {
-                tree.extend(members.iter().copied());
-            }
-            if !n.is_leaf() {
-                at.extend((0..n.len()).map(|i| n.child(i).0));
-            }
-        }
-        let blocks: Vec<[u8; 32]> = tree.iter().map(|c| wire::block::contract_for(BLOCK_CODE, c)).filter(|id| node.contracts.contains_key(id)).collect();
-        let lost: BTreeMap<[u8; 32], Vec<u8>> = if lose { blocks.iter().step_by(7).map(|id| (*id, node.contracts[id].clone())).collect() } else { BTreeMap::new() };
-        for id in lost.keys() {
-            node.contracts.remove(id);
-        }
+        let Lossy { mut node, mut now, lost, blocks, .. } = lossy_tree(41, lose.then_some(7));
         // REPAIR: a cold reader reads the whole tree.
         let mut r = reader_with(&node, engine::Params::default());
-        r.server.page.set_repair_pass(true, true);
+        r.server.page.begin_repair_pass(true);
         client(&mut r, &mut node, &mut now, &Request::Identity);
         assert_eq!(read_all(&mut r, &mut node, &mut now, 100), 2_000, "the repairing read did not read every row");
         let report = r.server.page.repair_report();
         let back = lost.iter().filter(|(id, st)| node.contracts.get(*id) == Some(*st)).count();
-        println!("lose={lose}: {} of {} blocks lost; the read found {} missing, put back {} (acked; {} race rebuilds of held blocks apart), rejected {}, gave up {}, parity mismatched {}; the node holds {back} of the lost again", lost.len(), blocks.len(), report.missing, report.put_back, report.reput, report.rejected, report.given_up, report.parity_mismatched);
+        println!("lose={lose}: {} of {blocks} blocks lost; the read found {} missing, put back {} (acked; {} race rebuilds of held blocks apart), rejected {}, gave up {}, parity mismatched {}; the node holds {back} of the lost again", lost.len(), report.missing, report.put_back, report.reput, report.rejected, report.given_up, report.parity_mismatched);
         assert_eq!(back, lost.len(), "the node does not hold every lost block again, byte for byte: {back} of {}", lost.len());
         assert_eq!((report.given_up, report.rejected, report.parity_mismatched), (0, 0, 0), "a repair failed: {:?}", report.why);
         assert_eq!((report.missing, report.put_back), (lost.len() as u64, lost.len() as u64), "the report does not count exactly what was lost and put back: {report:?}");
@@ -3474,53 +3490,138 @@ fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_
 /// the mutant "the engine ignores put_back", which turns this red.)
 #[test]
 fn a_check_reads_the_whole_tree_counts_every_lost_block_and_puts_nothing_then_a_repair_puts_them_back() {
-    let rows = |lo: u32, hi: u32| -> Vec<protocol::Op> { (lo..hi).map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), vec![i as u8; 90])).collect() };
-    let mut node = WireNode::new(&[43u8; 32]);
-    let mut now = 1_000;
-    let mut w = page_io(&node);
-    client(&mut w, &mut node, &mut now, &Request::Identity);
-    for (n, lo) in (0..2_000u32).step_by(500).enumerate() {
-        assert!(states(&client(&mut w, &mut node, &mut now, &Request::forced_write(n as u64 + 1, rows(lo, lo + 500))), n as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
-    }
-    let (_, root) = node.head().expect("a head");
-    let mut tree: std::collections::BTreeSet<freenet_prolly::Cid> = std::collections::BTreeSet::from([root]);
-    let mut at = vec![root];
-    while let Some(id) = at.pop() {
-        let bytes = freenet_prolly::store::Blocks::get(w.server.page.blocks(), &id).expect("the writer holds its tree").to_vec();
-        let n = freenet_prolly::node::Node::parse(&bytes).expect("a node");
-        tree.extend(n.parity());
-        for (_, members) in freenet_prolly::parity::group_members(&n) {
-            tree.extend(members.iter().copied());
-        }
-        if !n.is_leaf() {
-            at.extend((0..n.len()).map(|i| n.child(i).0));
-        }
-    }
-    let blocks: Vec<[u8; 32]> = tree.iter().map(|c| wire::block::contract_for(BLOCK_CODE, c)).filter(|id| node.contracts.contains_key(id)).collect();
-    let lost: Vec<[u8; 32]> = blocks.iter().step_by(7).copied().collect();
-    for id in &lost {
-        node.contracts.remove(id);
-    }
+    let Lossy { mut node, mut now, lost, blocks, .. } = lossy_tree(43, Some(7));
+    let lost: Vec<[u8; 32]> = lost.into_keys().collect();
     // THE CHECK.
     let puts_before = node.served.get("put block").copied().unwrap_or(0);
     let mut c = reader_with(&node, engine::Params::default());
-    c.server.page.set_repair_pass(true, false);
+    c.server.page.begin_repair_pass(false);
     client(&mut c, &mut node, &mut now, &Request::Identity);
     assert_eq!(read_all(&mut c, &mut node, &mut now, 300), 2_000, "the check did not read every row");
     let check = c.server.page.repair_report();
     let puts = node.served.get("put block").copied().unwrap_or(0) - puts_before;
-    println!("check: {} of {} current-tree blocks lost; missing {}, put back {}, given up {}; block PUTs on the wire {puts}", lost.len(), blocks.len(), check.missing, check.put_back, check.given_up);
+    println!("check: {} of {blocks} current-tree blocks lost; missing {}, put back {}, given up {}; block PUTs on the wire {puts}", lost.len(), check.missing, check.put_back, check.given_up);
     assert_eq!(puts, 0, "a CHECK sent {puts} block PUTs");
     assert_eq!(check.missing, lost.len() as u64, "the check did not count exactly the lost blocks: {check:?}");
     assert_eq!((check.put_back, check.given_up), (0, 0), "the check put back or gave up: {check:?}");
     assert!(lost.iter().all(|id| !node.contracts.contains_key(id)), "a lost block is back after a CHECK");
     // THE REPAIR afterwards.
     let mut r = reader_with(&node, engine::Params::default());
-    r.server.page.set_repair_pass(true, true);
+    r.server.page.begin_repair_pass(true);
     client(&mut r, &mut node, &mut now, &Request::Identity);
     assert_eq!(read_all(&mut r, &mut node, &mut now, 400), 2_000, "the repair did not read every row");
     let rep = r.server.page.repair_report();
     println!("repair after: missing {}, put back {}", rep.missing, rep.put_back);
     assert_eq!((rep.missing, rep.put_back, rep.given_up), (lost.len() as u64, lost.len() as u64, 0), "the repair after the check: {rep:?}");
     assert!(lost.iter().all(|id| node.contracts.contains_key(id)), "a lost block is not back after the repair");
+}
+
+/// **A PASS ENDS, AND NOTHING OUTLIVES IT** (the architect on #555: the pass's lifetime structural, not a caller's
+/// habit). On ONE long-lived reader: a repair pass over a damaged tree puts back every lost block; its END drops every
+/// REPAIR_PASS reader and clears its records -- the page then waits on NOTHING and holds no owed or watched parity -- and a
+/// SECOND pass on the same session reports only ITSELF (0 missing: the first pass's losses are not counted again).
+#[test]
+fn a_pass_ends_with_nothing_held_and_a_second_pass_on_the_same_session_reports_only_itself() {
+    let Lossy { mut node, mut now, lost, .. } = lossy_tree(45, Some(7));
+    let mut r = reader_with(&node, engine::Params::default());
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    r.server.page.begin_repair_pass(true);
+    assert_eq!(read_all(&mut r, &mut node, &mut now, 500), 2_000, "THE SETUP: the pass did not read every row");
+    let first = r.server.page.end_repair_pass();
+    assert_eq!((first.missing, first.put_back), (lost.len() as u64, lost.len() as u64), "THE SETUP: the first pass: {first:?}");
+    settle(&mut r, &mut node, &mut now);
+    assert!(!r.waiting(), "a GET is still held after the pass ended: {:?}", r.not_answering());
+    assert_eq!(r.server.page.repair_records(), (0, 0), "owed or watched parity outlived the pass");
+    r.server.page.begin_repair_pass(true);
+    assert_eq!(read_all(&mut r, &mut node, &mut now, 600), 2_000, "the second pass did not read every row");
+    let second = r.server.page.end_repair_pass();
+    assert_eq!((second.missing, second.put_back, second.given_up), (0, 0, 0), "the second pass counted the first's losses: {second:?}");
+}
+
+/// **OUTSIDE A PASS NOTHING IS RECORDED** (the architect on #555): a normal reader over a damaged tree reads every row --
+/// and still PUTS BACK the members it rebuilt (the read repair) -- but keeps no owed parity, no watched slot, nothing
+/// counted: a long-lived reading page accumulates nothing. (Putting back PARITY is the pass's job.)
+#[test]
+fn a_normal_read_over_a_damaged_tree_puts_back_its_members_and_records_nothing() {
+    let Lossy { mut node, mut now, lost, .. } = lossy_tree(47, Some(7));
+    let mut r = reader_with(&node, engine::Params::default());
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    assert_eq!(read_all(&mut r, &mut node, &mut now, 700), 2_000, "the normal read did not read every row");
+    let back = lost.keys().filter(|id| node.contracts.contains_key(*id)).count();
+    let rep = r.server.page.repair_report();
+    println!("normal read: {back} of {} lost blocks put back by the read repair; records {:?}; report missing {}", lost.len(), r.server.page.repair_records(), rep.missing);
+    assert!(back > 0, "THE SETUP: the normal read put back no member (the read repair did not run)");
+    assert_eq!(r.server.page.repair_records(), (0, 0), "a normal read recorded owed or watched parity");
+    assert_eq!((rep.missing, rep.put_back), (0, 0), "a normal read counted a pass's numbers: {rep:?}");
+}
+
+/// **A PASS ENDED WHILE ITS PARITY GETS ARE UNANSWERED HOLDS NONE OF THEM** (the architect on #555: rule 8 keeps a
+/// REPAIR_PASS reader asking a silent node for ever, so the END must drop it). A pass starts a whole-tree read; once
+/// its races watch parity slots the node stops answering (a silent node); the pass ENDS -- and no GET of a watched slot
+/// is owed any more, nothing is watched or owed. THE CONTROL (the setup's own): before the end, every watched slot's
+/// GET IS owed.
+#[test]
+fn a_pass_ended_while_its_parity_gets_are_unanswered_holds_none_of_them() {
+    let Lossy { mut node, mut now, .. } = lossy_tree(49, None);
+    let mut r = reader_with(&node, engine::Params::default());
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    r.server.page.begin_repair_pass(true);
+    r.client(&protocol::encode_session_request(4, 9, &Request::Range { req_id: 800, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 500 }).expect("encodes"));
+    // Serve until a race watches parity, then go SILENT: the frames after are never answered.
+    for _ in 0..500 {
+        if !r.server.page.watched_parity().is_empty() {
+            break;
+        }
+        now += 1;
+        for f in r.take_frames() {
+            if let Some(a) = node.serve(&f) {
+                r.inbound(&a, Ms(now));
+            }
+        }
+    }
+    let _ = r.take_frames();
+    let watched = r.server.page.watched_parity();
+    assert!(!watched.is_empty(), "THE SETUP: no race watched a parity slot");
+    assert!(watched.iter().all(|id| r.server.page.get_waiting(id)), "THE CONTROL: a watched slot's GET is not owed before the end");
+    assert!(watched.iter().all(|id| r.server.page.block_readers(id).audits), "THE CONTROL: a watched slot has no REPAIR_PASS reader before the end");
+    let _ = r.server.page.end_repair_pass();
+    // The PASS's readers are gone; a GET still owed is the READ's own (its race still wants the slot: the scan is in
+    // progress on a silent node), which normal read semantics keep -- never the ended pass's.
+    let pass_held: Vec<String> = watched.iter().filter(|id| r.server.page.block_readers(id).audits).map(engine::short_id).collect();
+    let orphan: Vec<String> = watched.iter().filter(|id| r.server.page.get_waiting(id) && !r.server.page.block_readers(id).any()).map(engine::short_id).collect();
+    let read_held = watched.iter().filter(|id| r.server.page.get_waiting(id)).count();
+    println!("pass ended with {} watched parity slots unanswered: REPAIR_PASS readers left {pass_held:?}; GETs owed with no reader {orphan:?}; GETs the live read still wants {read_held}", watched.len());
+    assert!(pass_held.is_empty(), "the ended pass still holds its readers on: {pass_held:?}");
+    assert!(orphan.is_empty(), "a GET is owed that nobody wants: {orphan:?}");
+    assert_eq!(r.server.page.repair_records(), (0, 0), "owed or watched parity outlived the pass");
+}
+
+/// **THE HELD SWEEP RE-ENTERED STAYS CONSISTENT** (the architect on #555). The sweep that ends a held block's GET lands
+/// the block for its waiting readers; that landing steps the engine, whose effects (another block's FetchBlock or
+/// Unwanted) run the sweep AGAIN from inside itself. Over a damaged tree whose members a whole-tree read rebuilds at
+/// once, the nested path RUNS (counted), and afterwards: every row read exactly once, and no block the page HOLDS still
+/// has a GET owed.
+#[test]
+fn the_held_sweep_reentered_from_a_landing_leaves_no_held_block_asked_and_every_row_read_once() {
+    let Lossy { mut node, mut now, tree, .. } = lossy_tree(41, Some(7));
+    let mut r = reader_with(&node, engine::Params::default());
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    let mut keys = Vec::new();
+    let mut after = None;
+    for n in 1u64.. {
+        let range = Request::Range { req_id: 900 + n, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: after.clone(), max_entries: 500 };
+        let got = client(&mut r, &mut node, &mut now, &range);
+        let (entries, cursor) = got.iter().find_map(|x| if let Reply::Page { req_id, entries, cursor, .. } = x { (*req_id == 900 + n).then(|| (entries.clone(), cursor.clone())) } else { None }).expect("a page");
+        keys.extend(entries.into_iter().map(|(k, _)| k));
+        match cursor {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    let unique: std::collections::BTreeSet<&Vec<u8>> = keys.iter().collect();
+    let asked: Vec<String> = tree.iter().filter(|c| freenet_prolly::store::Blocks::get(r.server.page.blocks(), c).is_some() && r.server.page.get_waiting(c)).map(engine::short_id).collect();
+    println!("nested sweeps {}; rows {} ({} unique); held blocks still asked {asked:?}", r.server.page.sweeps_nested(), keys.len(), unique.len());
+    assert!(r.server.page.sweeps_nested() > 0, "THE SETUP: the sweep was never re-entered: the test proves nothing about re-entry");
+    assert_eq!((keys.len(), unique.len()), (2_000, 2_000), "a row was lost or read twice through the re-entered sweep");
+    assert!(asked.is_empty(), "a HELD block still has a GET owed: {asked:?}");
 }

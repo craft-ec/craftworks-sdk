@@ -184,7 +184,7 @@ async fn run(net: &SilentNet, base: u16, every: usize, signer_wasm: &[u8], block
 
     // 1. REPAIR: a cold reader on peer reads the whole tree.
     let mut r1 = Io { sock: connect(&net.b.ws()).await?, io: reader(block_code, register_id), t0, replies: Vec::new() };
-    r1.io.server.page.set_repair_pass(true, true); // as Session::scan_all does for repairAll
+    r1.io.server.page.begin_repair_pass(true); // as Session::scan_all does for repairAll
     r1.identity().await?;
     let t1 = Instant::now();
     let rows1 = r1.read_all(100).await?;

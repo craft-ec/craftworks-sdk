@@ -705,7 +705,7 @@ impl Session {
         let after = if after.is_empty() { None } else { Some(core_types::hex::decode(after).ok_or_else(|| JsValue::from_str("after is not hex"))?) };
         // The whole-tree read IS the repair: its reads keep each parity GET out until the node answers.
         if let Some(p) = self.page_mut() {
-            p.server.page.set_repair_pass(true, put_back);
+            p.server.page.begin_repair_pass(put_back);
         }
         let r = self.db.scan_all(after, limit).map(|(rows, next)| serde_json::json!({ "rows": rows, "next": next.map(|k| core_types::hex::encode(&k)) }));
         self.answer(r)
@@ -718,34 +718,25 @@ impl Session {
     /// a repair did; `cancelled` says the pass was stopped, `check` that it put nothing back), each `health` one of
     /// `sdk.status.groupHealth`. `repairAll` / `checkAll` (js/engine-db.js) read the whole tree, then ask this.
     pub fn repair_report(&self, cancelled: bool, check: bool) -> String {
-        let Some(p) = self.page() else {
-            let o = PassOutcome::of(check, 0, 0, 0, 0, cancelled);
-            return serde_json::json!({ "outcome": o.code(), "outcomeList": o.list(), "missing": 0, "putBack": 0, "reput": 0, "rejected": 0, "givenUp": 0, "parityMismatched": 0, "pending": 0, "damaged": [], "why": null }).to_string();
-        };
-        let r = p.server.page.repair_report();
-        let damaged: Vec<serde_json::Value> = p
-            .server
-            .page
-            .damaged()
-            .iter()
-            .map(|d| serde_json::json!({ "block": engine::short_id(&d.block), "present": d.j, "k": d.k, "health": engine::repair::GroupHealth::Damaged.code() }))
-            .collect();
-        let outcome = PassOutcome::of(check, r.missing, r.put_back, r.rejected, r.given_up + damaged.len() as u64, cancelled);
-        serde_json::json!({
-            "outcome": outcome.code(),
-            "outcomeList": outcome.list(),
-            "missing": r.missing,
-            "putBack": r.put_back,
-            "reput": r.reput,
-            "rejected": r.rejected,
-            "givenUp": r.given_up,
-            "parityMismatched": r.parity_mismatched,
-            "pending": r.pending,
-            "damaged": damaged,
-            "why": r.why,
-        })
-        .to_string()
+        match self.page() {
+            Some(p) => report_json(&p.server.page, &p.server.page.repair_report(), cancelled, check),
+            None => empty_report_json(cancelled, check),
+        }
     }
+
+    /// THE PASS ENDS (the architect on #555): the pass's FINAL report, as [`Session::repair_report`]; then repair mode is
+    /// off, every REPAIR_PASS reader dropped (no GET held for a pass that is over) and the pass's records cleared, so a
+    /// later pass on this session reports only itself. `repairAll` / `checkAll` end with this, a cancel included.
+    pub fn end_repair_pass(&mut self, cancelled: bool, check: bool) -> String {
+        match self.page_mut() {
+            Some(p) => {
+                let r = p.server.page.end_repair_pass();
+                report_json(&p.server.page, &r, cancelled, check)
+            }
+            None => empty_report_json(cancelled, check),
+        }
+    }
+
 
     /// How `app`'s site publication stands, as JSON
     /// `{"state":"none"|"publishing"|"published"|"superseded"|"refused"|"cancelled","version":N,"said":"…"}`.
@@ -1857,3 +1848,36 @@ fn loc_of(id: &str) -> Result<craftworks_sdk::id::Loc, JsValue> {
         .ok_or_else(|| db_err(&DbError::Refused(format!("`{id}` is not a record id"))))
 }
 
+/// A pass's report as JSON (sdk#479): the counts, the damaged groups with their `groupHealth` word, and the outcome
+/// from ONE derivation (`PassOutcome::of`) with the list it is in.
+fn report_json(page: &page::Page, r: &page::RepairReport, cancelled: bool, check: bool) -> String {
+    let damaged: Vec<serde_json::Value> = page
+        .damaged()
+        .iter()
+        .map(|d| serde_json::json!({ "block": engine::short_id(&d.block), "present": d.j, "k": d.k, "health": engine::repair::GroupHealth::Damaged.code() }))
+        .collect();
+    let outcome = PassOutcome::of(check, r.missing, r.put_back, r.rejected, r.given_up + damaged.len() as u64, cancelled);
+    serde_json::json!({
+        "outcome": outcome.code(),
+        "outcomeList": outcome.list(),
+        "missing": r.missing,
+        "putBack": r.put_back,
+        "reput": r.reput,
+        "rejected": r.rejected,
+        "givenUp": r.given_up,
+        "parityMismatched": r.parity_mismatched,
+        "pending": r.pending,
+        "damaged": damaged,
+        "why": r.why,
+    })
+    .to_string()
+}
+
+/// The report of a session with no page yet: nothing read, nothing missing.
+fn empty_report_json(cancelled: bool, check: bool) -> String {
+    report_json_counts(PassOutcome::of(check, 0, 0, 0, 0, cancelled))
+}
+
+fn report_json_counts(o: PassOutcome) -> String {
+    serde_json::json!({ "outcome": o.code(), "outcomeList": o.list(), "missing": 0, "putBack": 0, "reput": 0, "rejected": 0, "givenUp": 0, "parityMismatched": 0, "pending": 0, "damaged": [], "why": null }).to_string()
+}

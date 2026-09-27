@@ -517,6 +517,8 @@ const repairSession = ({ pages = 3, pending = 2 } = {}) => {
     repair_report(cancelled, check) {
       return JSON.stringify({ outcome: cancelled ? "cancelled" : check ? "DEGRADED" : owed ? "partial" : "repaired", missing: 2, putBack: pending - owed, rejected: 0, givenUp: 0, parityMismatched: 0, pending: owed, damaged: [], why: null });
     },
+    ended: 0,
+    end_repair_pass(cancelled, check) { s.ended += 1; return s.repair_report(cancelled, check); },
     answerPuts() { owed = 0; s.wake(); },
     take_loads() { const out = ended; ended = []; return JSON.stringify(out); },
     resume() {},
@@ -539,6 +541,7 @@ await t("repairAll reads every page of the tree, waits for its put-backs' answer
   assert.equal(r.rows, 30);
   assert.equal(r.outcome, "repaired", "the outcome is not the session's word");
   assert.equal(r.putBack, 2);
+  assert.equal(s.ended, 1, "the pass was not ENDED once (its readers and records would outlive it)");
 });
 
 await t("checkAll reads every page with putBack false, waits for no put-back, and returns the session's check word", async () => {
@@ -559,6 +562,7 @@ await t("repairAllCancel stops a running pass: it resolves CANCELLED with the co
   const r = await run;
   assert.equal(r.outcome, "cancelled");
   assert.equal(r.pending, 2, "the counts so far were not reported");
+  assert.equal(s.ended, 1, "a cancelled pass was not ENDED");
 });
 
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");

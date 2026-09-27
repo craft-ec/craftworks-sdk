@@ -741,6 +741,12 @@ pub struct Page {
     missing_seen: BTreeSet<Cid>,
     repairs_acked: BTreeSet<Cid>,
     served_seen: BTreeSet<Cid>,
+    /// Repair PUTs sent during THIS pass, and `repairs_rejected` when it began: the report is of the pass alone.
+    pass_puts: BTreeSet<Cid>,
+    rejected_base: u64,
+    /// The held-block sweep's depth now, and how often it was entered from inside itself.
+    sweep_depth: u32,
+    sweeps_nested: u64,
     /// Deadlines of the ops in flight, and each op to re-send.
     /// Every op in flight: when it is due again, the op to re-send, when it
     /// went out and on which attempt (Karn: only an attempt-1 answer samples).
@@ -879,6 +885,10 @@ impl Page {
             missing_seen: BTreeSet::new(),
             repairs_acked: BTreeSet::new(),
             served_seen: BTreeSet::new(),
+            pass_puts: BTreeSet::new(),
+            rejected_base: 0,
+            sweep_depth: 0,
+            sweeps_nested: 0,
             deadlines: BTreeMap::new(),
             app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -1138,7 +1148,9 @@ impl Page {
                 self.put_again.remove(&id);
                 // A repaired block's PUT is done: it confirms nothing (the architect's (b)); it is counted put back.
                 if self.repair_puts.contains(&id) {
-                    self.repairs_acked.insert(id);
+                    if self.engine.in_repair_pass() {
+                        self.repairs_acked.insert(id);
+                    }
                     return;
                 }
                 match self.path {
@@ -1193,7 +1205,7 @@ impl Page {
                 // report counts a put-back of a block the node had as a re-put, never as a repair (sdk#479). Served
                 // BEFORE any repair PUT of it: a silent GET answered after the put-back landed is the repair's own
                 // bytes coming back (measured live: 5 of 6 lost blocks read that way).
-                if engine::read::matches_id(&id, &bytes) && !self.repair_puts.contains(&id) && !self.repairs_acked.contains(&id) {
+                if self.engine.in_repair_pass() && engine::read::matches_id(&id, &bytes) && !self.pass_puts.contains(&id) && !self.repairs_acked.contains(&id) {
                     self.served_seen.insert(id);
                 }
                 let Some(attempt) = self.answered_get(id) else { return };
@@ -1212,7 +1224,9 @@ impl Page {
             }
             Answer::GetMissed(id) => {
                 if let Some(attempt) = self.answered_get(id) {
-                    self.missing_seen.insert(id);
+                    if self.engine.in_repair_pass() {
+                        self.missing_seen.insert(id);
+                    }
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
                     // asked again on a backoff -- a node that has not got it
@@ -2331,6 +2345,12 @@ impl Page {
     /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
     /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
     fn end_unneeded_gets(&mut self) {
+        // A landing below steps the engine, whose effects end in this sweep again (re-entry, the architect on #555):
+        // counted, so a test can show the nested path ran and the page stayed consistent through it.
+        if self.sweep_depth > 0 {
+            self.sweeps_nested += 1;
+        }
+        self.sweep_depth += 1;
         let ended: Vec<Cid> = self
             .deadlines
                 .keys()
@@ -2358,6 +2378,12 @@ impl Page {
                 }
             }
         }
+        self.sweep_depth -= 1;
+    }
+
+    /// Held-block sweeps entered from inside another (a landing's step re-entering it): a cost counter.
+    pub fn sweeps_nested(&self) -> u64 {
+        self.sweeps_nested
     }
 
     /// What the engine publishes now, as a head.
@@ -2448,6 +2474,9 @@ impl Page {
                     self.engine.blocks_mut().insert(id, bytes);
                     if !self.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.put_again.contains_key(&id) {
                         self.repair_puts.insert(id);
+                        if self.engine.in_repair_pass() {
+                            self.pass_puts.insert(id);
+                        }
                         self.send(Waiting::Put(id), Op::Put { id, bytes: bytes.clone() });
                     }
                 }
@@ -2771,6 +2800,21 @@ impl Page {
 
     /// Is this page's PUT of `id` on the wire, or waiting to be sent again (sdk#433: what a node's text-named
     /// refusal may be attributed to)?
+    /// Is a GET of `id` still owed (on the wire, parked, or queued for a place)?
+    pub fn get_waiting(&self, id: &Cid) -> bool {
+        self.deadlines.get(&Waiting::Get(*id)).is_some_and(|d| !d.withdrawn) || self.get_queue.contains(id) || self.bg_queue.iter().any(|(w, _)| *w == Waiting::Get(*id))
+    }
+
+    /// Who wants block `id` now (the engine's readers: reads, repairs, a parked write, audits).
+    pub fn block_readers(&self, id: &Cid) -> engine::Readers {
+        self.engine.readers_of(id)
+    }
+
+    /// The parity slots the running pass watches ([`engine::Engine::watched_parity`]).
+    pub fn watched_parity(&self) -> Vec<Cid> {
+        self.engine.watched_parity()
+    }
+
     pub fn put_waiting(&self, id: &Cid) -> bool {
         self.deadlines.contains_key(&Waiting::Put(*id)) || self.put_again.contains_key(id)
     }
@@ -2780,11 +2824,35 @@ impl Page {
         self.repairs_rejected
     }
 
-    /// REPAIR mode (sdk#479, [`engine::Engine::set_repair_pass`]): a whole-tree read turns it on; `put_back` false makes
-    /// it a CHECK -- everything counted, nothing PUT ([`engine::Engine::set_put_back`]).
-    pub fn set_repair_pass(&mut self, on: bool, put_back: bool) {
-        self.engine.set_repair_pass(on);
-        self.engine.set_put_back(put_back);
+    /// A REPAIR PASS BEGINS (sdk#479, [`engine::Engine::begin_repair_pass`]): a whole-tree read; `put_back` false makes
+    /// it a CHECK -- everything counted, nothing PUT. Its records start empty, so its report is of THIS pass. (A normal
+    /// read, outside any pass, still puts back a member it rebuilt -- the read repair -- and records nothing.)
+    pub fn begin_repair_pass(&mut self, put_back: bool) {
+        // The pass's sets are empty here: the last pass's END cleared them (the one place a pass is cleared).
+        if !self.engine.in_repair_pass() {
+            self.rejected_base = self.repairs_rejected;
+        }
+        self.engine.begin_repair_pass(put_back);
+    }
+
+    /// The engine's REPAIR records held now, `(owed parity, watched slots)`: empty outside a pass (the architect on #555).
+    pub fn repair_records(&self) -> (usize, usize) {
+        self.engine.repair_records()
+    }
+
+    /// THE PASS ENDS (the architect on #555): its report, then repair mode off, every REPAIR_PASS reader dropped
+    /// through the one [`Event::AuditDrop`] path (no GET left held for a pass that is over), and its records cleared.
+    pub fn end_repair_pass(&mut self) -> RepairReport {
+        let report = self.repair_report();
+        for id in self.engine.end_repair_pass() {
+            let more = self.engine.step(Event::AuditDrop { id, pass: engine::REPAIR_PASS });
+            self.carry_out(more);
+        }
+        self.missing_seen.clear();
+        self.served_seen.clear();
+        self.repairs_acked.clear();
+        self.pass_puts.clear();
+        report
     }
 
     /// REPAIR's numbers (sdk#479), since this page opened: what its reads found missing on the node, what it put back
@@ -2798,7 +2866,7 @@ impl Page {
             missing: self
                 .missing_seen
                 .iter()
-                .chain(self.repair_puts.iter())
+                .chain(self.pass_puts.iter())
                 .chain(self.repairs_acked.iter())
                 .chain(self.engine.lost().iter())
                 .filter(|id| !self.served_seen.contains(*id))
@@ -2806,10 +2874,11 @@ impl Page {
                 .len() as u64,
             put_back: self.repairs_acked.difference(&self.served_seen).count() as u64,
             reput: self.repairs_acked.intersection(&self.served_seen).count() as u64,
-            rejected: self.repairs_rejected,
-            given_up: self.engine.repair_counts().2,
+            rejected: self.repairs_rejected - self.rejected_base,
+            given_up: self.engine.pass_given_up(),
             parity_mismatched: self.engine.parity_counts().2,
-            pending: self.repair_puts.iter().filter(|id| !self.repairs_acked.contains(*id)).count() as u64,
+            // Sent this pass, not yet answered (a finally refused one leaves `repair_puts`).
+            pending: self.pass_puts.iter().filter(|id| self.repair_puts.contains(*id) && !self.repairs_acked.contains(*id)).count() as u64,
             why: self.engine.repair_failed().map(str::to_string),
         }
     }

@@ -113,6 +113,7 @@ const TRANSPORT_ONLY: &[&str] = &[
     // no node to have lost anything.
     "scan_all",
     "repair_report",
+    "end_repair_pass",
     // WHOSE NODE: ask the node's signer which head it signs for, registering
     // nothing (a published app opens writable for its publisher). An
     // in-memory store has no node and no signer to ask.

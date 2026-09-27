@@ -532,7 +532,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       while (putBack && !repairCancelled && JSON.parse(session.repair_report(false, false)).pending > 0) {
         await new Promise(resolve => roomWaiters.push(resolve));
       }
-      return { rows, ...JSON.parse(session.repair_report(repairCancelled, !putBack)) };
+      // THE PASS ENDS here, a cancel included: its final report, and nothing left held for it (the architect on #555).
+      return { rows, ...JSON.parse(session.end_repair_pass(repairCancelled, !putBack)) };
     },
     /**
      * CHECK (sdk#479): the same whole-tree read and report as `repairAll`, and NOTHING is PUT -- what the node lacks is
