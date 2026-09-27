@@ -69,13 +69,14 @@ fn an_id_among_slots_is_looked_up_only_through_slots_of() {
     assert!(found.is_empty(), "a first-match lookup of an id outside engine::repair::slots_of (use slots_of: EVERY slot):\n{}", found.join("\n"));
 }
 
-/// The detector's control: each shape of the defect IS caught (three forms, and the sites sdk#542 converted), and the
+/// The detector's control: each shape of the defect IS caught (three forms, and the three sites sdk#542 converted: the repair's, find_group's, and app_publish's mark), and the
 /// lookups it must leave alone are not.
 #[test]
 fn the_detector_catches_each_first_match_shape() {
     for caught in [
         "            let Some(i) = r.group.slots.iter().position(|s| *s == slot) else { continue };",
         "            let Some(missing_ix) = members.iter().position(|m| *m == missing) else { continue };",
+        "    let i = s.keys.iter().position(|k| k == key)?;",
         "    let at = group.slots.iter().position(|s| s == &id);",
         "    let at = cids.iter().position(|&c| c == id).unwrap();",
         "    let at = cids.iter().position(|c| id == *c)?;",

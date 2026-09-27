@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn words_is_every_enum_s_all_each_word_once() {
         let v = words();
-        let want: [(&str, Vec<&str>); 6] = [
+        let want: [(&str, Vec<&str>); 7] = [
             ("rowState", RowState::ALL.iter().map(|w| w.code()).collect()),
             ("putStatus", PutStatus::ALL.iter().map(|w| w.code()).collect()),
             ("siteStatus", SiteStatus::ALL.iter().map(|w| w.code()).collect()),

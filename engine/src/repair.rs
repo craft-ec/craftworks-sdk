@@ -26,8 +26,10 @@ pub const MAX_SEARCH_NODES: usize = 4096;
 /// values are one block, so one id can fill several slots, and an answer for it -- bytes or NotFound -- answers EVERY
 /// one. A first-match lookup (`position`) marked one and was the defect twice (sdk#527's mark, sdk#542's repair); the
 /// `slots_of` control (engine/tests/slots_of.rs) fails the build on one anywhere else.
-pub fn slots_of<'a>(slots: &'a [Cid], id: &'a Cid) -> impl Iterator<Item = usize> + 'a {
-    slots.iter().enumerate().filter(move |(_, s)| *s == id).map(|(i, _)| i)
+/// Generic over what a slot holds (a block's `Cid`, a piece's node key): page-io's publish marks its piece sets through
+/// it too.
+pub fn slots_of<'a, T: PartialEq<Q>, Q: ?Sized>(slots: &'a [T], id: &'a Q) -> impl Iterator<Item = usize> + 'a {
+    slots.iter().enumerate().filter(move |(_, s)| **s == *id).map(|(i, _)| i)
 }
 
 /// One sibling group, as a repair needs it.
