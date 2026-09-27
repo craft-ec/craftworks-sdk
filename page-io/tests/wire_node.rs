@@ -3450,10 +3450,10 @@ fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_
         assert_eq!(read_all(&mut r, &mut node, &mut now, 100), 2_000, "the repairing read did not read every row");
         let report = r.server.page.repair_report();
         let back = lost.iter().filter(|(id, st)| node.contracts.get(*id) == Some(*st)).count();
-        println!("lose={lose}: {} of {} blocks lost; the read found {} missing, put back {} (acked), rejected {}, gave up {}, parity mismatched {}; the node holds {back} of the lost again", lost.len(), blocks.len(), report.missing, report.put_back, report.rejected, report.given_up, report.parity_mismatched);
+        println!("lose={lose}: {} of {} blocks lost; the read found {} missing, put back {} (acked; {} race rebuilds of held blocks apart), rejected {}, gave up {}, parity mismatched {}; the node holds {back} of the lost again", lost.len(), blocks.len(), report.missing, report.put_back, report.reput, report.rejected, report.given_up, report.parity_mismatched);
         assert_eq!(back, lost.len(), "the node does not hold every lost block again, byte for byte: {back} of {}", lost.len());
         assert_eq!((report.given_up, report.rejected, report.parity_mismatched), (0, 0, 0), "a repair failed: {:?}", report.why);
-        assert!(report.missing >= lost.len() as u64 && report.put_back >= lost.len() as u64, "the report does not count what was lost and put back: {report:?}");
+        assert_eq!((report.missing, report.put_back), (lost.len() as u64, lost.len() as u64), "the report does not count exactly what was lost and put back: {report:?}");
         // A FRESH reader reads it all from the node, and nothing is missing.
         let mut f = reader_with(&node, engine::Params::default());
         client(&mut f, &mut node, &mut now, &Request::Identity);

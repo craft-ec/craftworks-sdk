@@ -14,6 +14,11 @@ use tokio_tungstenite::tungstenite::Message;
 pub trait Hooks: Send + Sync + 'static {
     /// A frame from the page, on its way to the node unchanged.
     fn up(&self, _conn: u64, _m: &Message) {}
+    /// What goes on to the node for a frame from the page, in order, and what the page is answered INSTEAD (the node
+    /// never sees a request it is not handed). Default: the frame itself, and nothing else (ws-drop's is the one other).
+    fn pass_up(&self, _conn: u64, m: Message) -> (Vec<Message>, Option<Message>) {
+        (vec![m], None)
+    }
     /// A frame from the node: what the page is sent instead (`None`: nothing).
     fn down(&self, conn: u64, m: Message) -> Option<Message>;
 }
@@ -71,18 +76,32 @@ async fn websocket(client: TcpStream, node_port: u16, conn: u64, hooks: Arc<dyn 
     let (mut c_tx, mut c_rx) = client.split();
     let (mut n_tx, mut n_rx) = node.split();
     let up_hooks = hooks.clone();
+    // A hook's own answer to the page (a request it did not hand the node) goes down beside the node's answers.
+    let (to_page, mut from_hooks) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let up = async move {
         while let Some(m) = c_rx.next().await {
             let m = m?;
             up_hooks.up(conn, &m);
-            n_tx.send(m).await?;
+            let (on, instead) = up_hooks.pass_up(conn, m);
+            for m in on {
+                n_tx.send(m).await?;
+            }
+            if let Some(a) = instead {
+                let _ = to_page.send(a);
+            }
         }
         anyhow::Ok(())
     };
     let down = async move {
-        while let Some(m) = n_rx.next().await {
-            if let Some(m) = hooks.down(conn, m?) {
-                c_tx.send(m).await?;
+        loop {
+            tokio::select! {
+                m = n_rx.next() => {
+                    let Some(m) = m else { break };
+                    if let Some(m) = hooks.down(conn, m?) {
+                        c_tx.send(m).await?;
+                    }
+                }
+                Some(a) = from_hooks.recv() => c_tx.send(a).await?,
             }
         }
         anyhow::Ok(())

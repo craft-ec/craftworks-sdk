@@ -463,7 +463,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
      * REPAIR (sdk#479): read the WHOLE tree -- every key of every app -- through the normal read, which rebuilds a
      * block the node lost from any `k` of its group, re-encodes a lost parity block with the save's own code, and PUTs
      * both back; then wait for those PUTs' answers, and resolve with the session's report: `outcome` a word of
-     * `sdk.status.repairOutcome`, the counts (`missing`, `putBack`, `rejected`, `givenUp`, `parityMismatched`,
+     * `sdk.status.repairOutcome`, the counts (`missing`, `putBack` -- of those -- `reput`, `rejected`, `givenUp`, `parityMismatched`,
      * `pending`), each `damaged` group with its `sdk.status.groupHealth` word, `why`, and the `rows` read.
      *
      * Run it on a session whose store is COLD for the tree (a fresh reader of it): a page that already holds a block

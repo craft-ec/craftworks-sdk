@@ -530,8 +530,12 @@ pub const HEAD_BACKSTOP_MS: u64 = 120_000;
 pub struct RepairReport {
     /// Distinct blocks the node answered NotFound (members and parity).
     pub missing: u64,
-    /// Repair PUTs the node ACKED: members rebuilt from their group, parity re-encoded (each block once).
+    /// Blocks the node answered NotFound and then ACKED a repair PUT of: members rebuilt from their group, parity
+    /// re-encoded (each block once). Only what was LOST counts here.
     pub put_back: u64,
+    /// Repair PUTs acked of blocks the node never answered NotFound: a race rebuilt a member before its own answer
+    /// came (the node had it). Counted apart, so a rebuild never passes for a repair.
+    pub reput: u64,
     /// Repair PUTs the node's Block contract refused, finally.
     pub rejected: u64,
     /// Groups a read could not solve (fewer than `k` anywhere).
@@ -2740,7 +2744,8 @@ impl Page {
     pub fn repair_report(&self) -> RepairReport {
         RepairReport {
             missing: self.missing_seen.len() as u64,
-            put_back: self.repairs_acked.len() as u64,
+            put_back: self.repairs_acked.intersection(&self.missing_seen).count() as u64,
+            reput: self.repairs_acked.difference(&self.missing_seen).count() as u64,
             rejected: self.repairs_rejected,
             given_up: self.engine.repair_counts().2,
             parity_mismatched: self.engine.parity_counts().2,

@@ -263,3 +263,86 @@ fn the_default_log_writes_each_line_to_stderr() {
     assert!(stderr.lines().any(|l| l == want), "the default Log did not write the line to stderr:\n{stderr}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains(&line.to_string()), "the default Log wrote to stdout");
 }
+
+/// A node that answers every WHOLE request it receives with a `PutResponse` for its key (a PUT) and COUNTS them, so a
+/// test sees what reached the node, not only what the page was answered.
+async fn counting_node(seen: Arc<Mutex<Vec<ContractInstanceId>>>) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (s, _) = l.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(s).await.unwrap();
+        let (mut tx, mut rx) = ws.split();
+        let mut reqs = probe::frames::Requests::default();
+        while let Some(Ok(Message::Binary(b))) = rx.next().await {
+            if let Ok(probe::frames::Frame::Whole(freenet_stdlib::client_api::ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Put { contract, .. }))) = reqs.push("node", &b) {
+                seen.lock().unwrap().push(*contract.key().id());
+                tx.send(Message::Binary(ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: contract.key() })).into())).await.unwrap();
+            }
+        }
+    });
+    port
+}
+
+/// **ws-drop (sdk#479): a dropped block NEVER REACHES THE NODE, and the page is answered for it.** Every 2nd Block PUT
+/// is dropped -- a CHUNKED one held until whole and dropped whole -- and so is a later re-send of a dropped block; a
+/// kept chunked block reaches the node whole; a non-block PUT is never counted or dropped. The page is answered for
+/// every PUT; the node saw only the kept ones; the hook's lines name exactly the dropped blocks, byte for byte.
+#[tokio::test]
+async fn ws_drop_keeps_every_nth_block_off_the_node_and_answers_the_page_for_it() {
+    let code = b"block contract code".to_vec();
+    let big = vec![7u8; wire::MAX_CHUNK * 2 + 10];
+    let bodies: Vec<Vec<u8>> = vec![b"one".to_vec(), [b"two".to_vec(), big.clone()].concat(), [b"three".to_vec(), big.clone()].concat(), [b"four".to_vec(), big].concat()];
+    let blocks: Vec<(freenet_prolly::Cid, ContractContainer, Vec<u8>)> = bodies
+        .iter()
+        .map(|b| {
+            let cid = freenet_prolly::block_id(kind::RAW, b);
+            (cid, wire::block::block_contract(&code, &cid), wire::block::block_state(&cid, b).unwrap())
+        })
+        .collect();
+    let (other, other_key) = contract(b"an app container", b"");
+    let (log, said) = captured();
+    let hooks = Arc::new(probe::drop::DropEvery::with_log(2, log));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let node = counting_node(seen.clone()).await;
+    let listen = free_port();
+    tokio::spawn(serve(listen, node, serde_json::json!({}), hooks.clone()));
+    let mut ws = None;
+    for _ in 0..100 {
+        if let Ok((w, _)) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{listen}/v1/contract/command?encodingProtocol=native")).await {
+            ws = Some(w);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut ws = ws.expect("THE SETUP: the proxy never listened");
+    // The four blocks, the app container, then a RE-SEND of the second block.
+    let mut sent: Vec<(ContractContainer, Vec<u8>)> = blocks.iter().map(|(_, c, s)| (c.clone(), s.clone())).collect();
+    sent.push((other, b"state".to_vec()));
+    sent.push((blocks[1].1.clone(), blocks[1].2.clone()));
+    for (n, (c, s)) in sent.iter().enumerate() {
+        let frames = wire::frame_put(c.clone(), WrappedState::new(s.clone()), n as u32 + 1).unwrap();
+        if n == 1 {
+            assert!(frames.len() > 1, "THE SETUP: the dropped block is not chunked");
+        }
+        for f in frames {
+            ws.send(Message::Binary(f.into())).await.unwrap();
+        }
+        let a = answer(&mut ws).await;
+        match a {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => assert_eq!(key.id(), c.key().id(), "PUT {n} answered under another key"),
+            other => panic!("PUT {n} answered {other:?}"),
+        }
+    }
+    let kept: Vec<ContractInstanceId> = vec![*blocks[0].1.key().id(), *blocks[2].1.key().id(), *other_key.id()];
+    assert_eq!(*seen.lock().unwrap(), kept, "the node saw other than the kept PUTs");
+    let ids: Vec<String> = [1usize, 3].iter().map(|i| blocks[*i].1.key().id().to_string()).collect();
+    assert_eq!(
+        *said.lock().unwrap(),
+        vec![
+            format!(r#"{{"block":"{}","block_puts_seen":2,"dropped":"{}","dropped_total":1,"kind":{}}}"#, short(&blocks[1].0), ids[0], kind::RAW),
+            format!(r#"{{"block":"{}","block_puts_seen":4,"dropped":"{}","dropped_total":2,"kind":{}}}"#, short(&blocks[3].0), ids[1], kind::RAW),
+        ],
+        "the hook's lines are not exactly the dropped blocks"
+    );
+}
