@@ -1,6 +1,7 @@
 //! DROP BLOCKS AT PUBLISH (`probe::drop`, sdk#479): a proxy between a WRITER's page and its node that hands on
-//! everything except every `N`th Block-contract PUT (and any re-send of one), which it answers itself with a
-//! `PutResponse`: those blocks are never stored on the network, as if the node acked them and lost them. A read of the
+//! everything except the FIRST send of every `N`th Block-contract PUT, which it answers itself with a `PutResponse`:
+//! the node acked it and lost it. A re-send passes (a page re-PUTs its own commit root; a block the page took as acked
+//! is never re-sent, so it stays lost). A read of the
 //! tree afterwards finds them MISSING -- REPAIR's real-network step. Each dropped block is a JSON line on stderr.
 //!
 //! usage: ws-drop <listen-port> <node-ws-port> --every N     (both on 127.0.0.1; `probe::node::RESERVED` refused)

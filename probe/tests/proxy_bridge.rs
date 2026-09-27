@@ -284,9 +284,10 @@ async fn counting_node(seen: Arc<Mutex<Vec<ContractInstanceId>>>) -> u16 {
     port
 }
 
-/// **ws-drop (sdk#479): a dropped block NEVER REACHES THE NODE, and the page is answered for it.** Every 2nd Block PUT
-/// is dropped -- a CHUNKED one held until whole and dropped whole -- and so is a later re-send of a dropped block; a
-/// kept chunked block reaches the node whole; a non-block PUT is never counted or dropped. The page is answered for
+/// **ws-drop (sdk#479): a dropped block's FIRST send never reaches the node, and the page is answered for it.** Every
+/// 2nd Block PUT is dropped -- a CHUNKED one held until whole and dropped whole; a later RE-SEND of a dropped block
+/// passes (the loss was once); a kept chunked block reaches the node whole; a non-block PUT is never counted or
+/// dropped. The page is answered for
 /// every PUT; the node saw only the kept ones; the hook's lines name exactly the dropped blocks, byte for byte.
 #[tokio::test]
 async fn ws_drop_keeps_every_nth_block_off_the_node_and_answers_the_page_for_it() {
@@ -334,14 +335,15 @@ async fn ws_drop_keeps_every_nth_block_off_the_node_and_answers_the_page_for_it(
             other => panic!("PUT {n} answered {other:?}"),
         }
     }
-    let kept: Vec<ContractInstanceId> = vec![*blocks[0].1.key().id(), *blocks[2].1.key().id(), *other_key.id()];
-    assert_eq!(*seen.lock().unwrap(), kept, "the node saw other than the kept PUTs");
+    let kept: Vec<ContractInstanceId> = vec![*blocks[0].1.key().id(), *blocks[2].1.key().id(), *other_key.id(), *blocks[1].1.key().id()];
+    assert_eq!(*seen.lock().unwrap(), kept, "the node saw other than the kept PUTs and the re-send");
     let ids: Vec<String> = [1usize, 3].iter().map(|i| blocks[*i].1.key().id().to_string()).collect();
     assert_eq!(
         *said.lock().unwrap(),
         vec![
             format!(r#"{{"block":"{}","block_puts_seen":2,"dropped":"{}","dropped_total":1,"kind":{}}}"#, short(&blocks[1].0), ids[0], kind::RAW),
             format!(r#"{{"block":"{}","block_puts_seen":4,"dropped":"{}","dropped_total":2,"kind":{}}}"#, short(&blocks[3].0), ids[1], kind::RAW),
+            format!(r#"{{"resent":"{}"}}"#, ids[0]),
         ],
         "the hook's lines are not exactly the dropped blocks"
     );

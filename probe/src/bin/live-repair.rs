@@ -2,8 +2,9 @@
 //!
 //! A private two-node network of this probe's own ([`probe::silent::SilentNet`]: gateway "gw" and "peer", each in its
 //! own dirs and web cache, never the owner's ports). A WRITER page on gw publishes a tree of rows THROUGH ws-drop
-//! ([`probe::drop::DropEvery`], in process): every `N`th Block PUT never reaches gw and is answered by the proxy, so
-//! those blocks were NEVER STORED on the network. The writer is then closed. On peer:
+//! ([`probe::drop::DropEvery`], in process): every `N`th Block PUT's first send never reaches gw and is answered by the
+//! proxy, so those blocks were never stored -- unless the page sends one again (its own commit root: then it is
+//! stored, and not counted lost). The writer is then closed. On peer:
 //!  1. a COLD reader reads every row through the normal read (REPAIR: a race finds a block NotFound, rebuilds it from
 //!     any `k` of its group -- a lost parity re-encoded -- and PUTs it back). Its report must count as MISSING at
 //!     least every dropped block (the loss is real and the reads saw it: the non-vacuous half), and put back exactly
@@ -112,12 +113,20 @@ async fn run(net: &SilentNet, base: u16, every: usize, signer_wasm: &[u8], block
 
     // ws-drop in front of gw, in process: its lines kept for the checks and printed.
     let drops: Arc<Mutex<Vec<ContractInstanceId>>> = Arc::new(Mutex::new(Vec::new()));
+    let resent: Arc<Mutex<Vec<ContractInstanceId>>> = Arc::new(Mutex::new(Vec::new()));
     let keep = drops.clone();
+    let keep_resent = resent.clone();
     let log = probe::proxy::Log::to(move |l| {
         println!("ws-drop: {l}");
         if let Some(id) = l.get("dropped").and_then(|v| v.as_str()) {
             if let Ok(id) = id.parse::<ContractInstanceId>() {
                 keep.lock().unwrap().push(id);
+            }
+        }
+        // A dropped block the page SENT AGAIN (its own commit root) reached the node: it is not lost.
+        if let Some(id) = l.get("resent").and_then(|v| v.as_str()) {
+            if let Ok(id) = id.parse::<ContractInstanceId>() {
+                keep_resent.lock().unwrap().push(id);
             }
         }
     });
@@ -175,9 +184,10 @@ async fn run(net: &SilentNet, base: u16, every: usize, signer_wasm: &[u8], block
     let current: std::collections::HashSet<ContractInstanceId> = tree.iter().map(|c| ContractInstanceId::new(wire::block::contract_for(block_code, c))).collect();
     drop(w);
     let all_dropped: Vec<ContractInstanceId> = drops.lock().unwrap().clone();
-    let dropped: Vec<ContractInstanceId> = all_dropped.iter().copied().filter(|id| current.contains(id)).collect();
+    let resent: Vec<ContractInstanceId> = resent.lock().unwrap().clone();
+    let dropped: Vec<ContractInstanceId> = all_dropped.iter().copied().filter(|id| current.contains(id) && !resent.contains(id)).collect();
     let rows_written = (WRITES as usize) * ROWS_PER_WRITE as usize;
-    println!("writer on gw: {rows_written} rows published; ws-drop dropped {} blocks (never stored), {} of them in the CURRENT tree of {} blocks; writer closed at t+{} s", all_dropped.len(), dropped.len(), current.len(), t0.elapsed().as_secs());
+    println!("writer on gw: {rows_written} rows published; ws-drop dropped {} blocks once, {} re-sent by the page (stored), {} lost in the CURRENT tree of {} blocks; writer closed at t+{} s", all_dropped.len(), resent.len(), dropped.len(), current.len(), t0.elapsed().as_secs());
     if dropped.is_empty() {
         bail!("SETUP: ws-drop dropped no block of the current tree: the run proves nothing");
     }
@@ -223,7 +233,7 @@ async fn run(net: &SilentNet, base: u16, every: usize, signer_wasm: &[u8], block
     if rows2 != rows_written || rep2.missing != 0 {
         bail!("the fresh reader read {rows2} rows and found {} missing", rep2.missing);
     }
-    Ok(format!("GREEN: {} current-tree blocks never stored (ws-drop every {every}th Block PUT) -> repair found {} missing, put back {} -> peer serves every one -> a fresh reader reads {rows2} rows with 0 missing", dropped.len(), rep.missing, rep.put_back))
+    Ok(format!("GREEN: {} current-tree blocks lost (ws-drop: every {every}th Block PUT's first send) -> repair found {} missing, put back {} -> peer serves every one -> a fresh reader reads {rows2} rows with 0 missing", dropped.len(), rep.missing, rep.put_back))
 }
 
 #[tokio::main(flavor = "current_thread")]

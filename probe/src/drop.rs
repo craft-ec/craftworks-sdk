@@ -1,6 +1,8 @@
 //! DROP BLOCKS AT PUBLISH (sdk#479, REPAIR's real-network step): between a WRITER's page and its node, every `n`th
-//! Block-contract PUT is NOT handed to the node -- and neither is any later re-send of it -- while the page is answered
-//! with a `PutResponse` from here, as a node that acked the block and then lost it would. The writer publishes as
+//! Block-contract PUT's FIRST send is NOT handed to the node, while the page is answered with a `PutResponse` from
+//! here, as a node that acked the block and then lost it would. A RE-SEND of it passes (engineer5 on the live step:
+//! dropping every re-send made a lost commit ROOT unrecoverable, a network no page can publish on; the page's own
+//! re-PUT of its root is what recovers that). The writer publishes as
 //! usual; the dropped blocks were never stored anywhere, so a read of the tree finds them MISSING on the network --
 //! what REPAIR must put back. (ws-withhold drops only an ANSWER and ws-lose only lies to a reader: neither makes a
 //! block absent.) A request split into chunks is held until it is whole, then handed on whole or dropped whole.
@@ -22,9 +24,11 @@ pub struct DropEvery {
 struct State {
     /// Per page connection: its requests' reassembly, and each chunked stream's frames held until it is whole.
     conns: HashMap<u64, (Requests, HashMap<u32, Vec<Message>>)>,
-    /// Block PUTs seen (first sends), and the blocks dropped: a re-send of one is dropped too.
+    /// Block PUTs seen (first sends), and the blocks dropped once: a re-send of one passes to the node.
     seen: usize,
     dropped: HashSet<ContractInstanceId>,
+    /// Dropped blocks whose re-send has passed (each said once).
+    resent: HashSet<ContractInstanceId>,
 }
 
 /// THE LOG LINE for one dropped block. LOAD-BEARING: the run's evidence reads it.
@@ -57,7 +61,11 @@ impl DropEvery {
             code.is_some_and(|code| contract_keys::instance(&code, cid).as_slice() == key.id().as_bytes())
         })?;
         if st.dropped.contains(key.id()) {
-            return Some(key); // a re-send of a dropped block: dropped too
+            // A RE-SEND of a dropped block reaches the node: the loss was once. Said once, so a run knows it is stored.
+            if st.resent.insert(*key.id()) {
+                self.log.say(&serde_json::json!({ "resent": key.id().to_string() }));
+            }
+            return None;
         }
         st.seen += 1;
         if !st.seen.is_multiple_of(self.every) {
