@@ -77,5 +77,14 @@ await t("**a door that cannot watch is thrown by name**, never a watch that sile
   assert.throws(() => db.watchDefinition("draft", () => {}), /cannot be watched/);
 });
 
+await t("**engine: a write door handed an app is refused by name**, and nothing reaches the session", async () => {
+  const s = recordingSession();
+  let wrote = 0;
+  s.draft_put = () => { wrote += 1; };
+  const db = engineDb(s);
+  await assert.rejects(() => db.draftPut("meta", {}, "someone-else"), e => e.code === "REFUSED" && /`draftPut` takes no app/.test(e.message));
+  assert.equal(wrote, 0, "the refused write reached the session");
+});
+
 if (failures) { process.stdout.write(`\n${failures} failing\n`); process.exit(1); }
 process.stdout.write("\nall passing\n");

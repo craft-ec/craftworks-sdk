@@ -1,5 +1,5 @@
 import { openSession, open as openWith, openAsked as openAskedWith, SHIPPED_ARTEFACTS } from "./session.js";
-import { engineDb, sameRows, BINDING } from "./engine-db.js";
+import { engineDb, sameRows, BINDING, noAppForAWrite } from "./engine-db.js";
 
 // Plain-object API over the wasm surface. `raw` is the wasm-bindgen module.
 //
@@ -64,19 +64,22 @@ export function wrap(raw) {
     async delete(domain, id) { return this.#db.delete(domain, id); }
     // THE DEFINITION DOORS (app-as-data P2, ARCHITECTURE §19): the app's definition, as data in its reserved
     // domains -- the only writes of them. `key`: `meta`, `c/<id>` or `d/<domain>`.
-    async draftPut(key, body) { this.#db.draft_put(key, JSON.stringify(body)); }
+    // A write door takes no app (`noAppForAWrite`): the in-tab db writes only its own draft.
+    async draftPut(key, body, ...extra) { noAppForAWrite("draftPut", extra); this.#db.draft_put(key, JSON.stringify(body)); }
     // A FILE of the app's code (app-as-data P5): `f/<path>`'s bytes (a Uint8Array) and meta -- one form per kind.
-    async draftFile(path, bytes, meta = {}) { this.#db.draft_file(path, bytes, JSON.stringify(meta)); }
-    async draftDelete(key) { return this.#db.draft_delete(key); }
+    async draftFile(path, bytes, meta = {}, ...extra) { noAppForAWrite("draftFile", extra); this.#db.draft_file(path, bytes, JSON.stringify(meta)); }
+    async draftDelete(key, ...extra) { noAppForAWrite("draftDelete", extra); return this.#db.draft_delete(key); }
     // An in-tab db has no node: a SITE is published only through a session (`publishDefinition({ site })` there).
-    async publishDefinition({ site } = {}) {
-      if (site) throw Object.assign(new Error("an in-tab database has no node: a site is published through a session's publishDefinition({ site })"), { code: "REFUSED" });
+    // Its one argument is those options, never an app (`noAppForAWrite`).
+    async publishDefinition(opts = {}, ...extra) {
+      noAppForAWrite("publishDefinition", typeof opts === "string" ? [opts, ...extra] : extra);
+      if (opts?.site) throw Object.assign(new Error("an in-tab database has no node: a site is published through a session's publishDefinition({ site })"), { code: "REFUSED" });
       return this.#db.publish_definition();
     }
     async definitionApps() { return JSON.parse(this.#db.definition_apps()); }
     // `[{ key, body, bytes? }]`: a file's bytes a Uint8Array, as the SDK hands them over.
     async definition(which, app) { return this.#db.definition(which, app ?? undefined); }
-    async markPublished(domain) { return JSON.parse(this.#db.mark_published(domain)); }
+    async markPublished(domain, ...extra) { noAppForAWrite("markPublished", extra); return JSON.parse(this.#db.mark_published(domain)); }
     async isPublished(domain) { return this.#db.is_published(domain); }
     async publishedState(domain) { return JSON.parse(this.#db.published_state(domain)); }
     async scan(domain, { reverse = false, limit = 0, after = "" } = {}) {
