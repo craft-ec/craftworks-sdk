@@ -907,7 +907,8 @@ impl PageIo {
                 // A cancel of the SITE (the Session's cancel_site) ends the publish too (the architect's R2): the
                 // table's own Siting x Cancel cell, never a Siting left waiting for an answer that cannot come.
                 Some(Publication::Cancelled) => Some(PublishEvent::Cancel),
-                Some(Publication::Publishing { .. }) | None => None,
+                // `Reading` is a follow's word while no publish is in flight (the one derivation): not an end.
+                Some(Publication::Publishing { .. } | Publication::Reading) | None => None,
             };
             if let Some(ev) = ev {
                 self.publish_step(&app, ev);
