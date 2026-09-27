@@ -67,6 +67,10 @@ pub enum Verdict {
 pub struct Lose {
     target: Target,
     n: usize,
+    /// [`Target::Data`] BY IDENTITY (7c's realnet: "the first group of k >= 2" is the tree's SHAPE, and chose the root's
+    /// children, k = 2, instead of the bulk rows): only a leaf's group of referenced values whose EVERY member's key
+    /// holds `domain ‖ 0` -- the record key's own form (`T_RECORD | domain | 0 | rkey`, src/db.rs `record_key`).
+    domain: Option<Vec<u8>>,
     chosen: Option<Chosen>,
     /// GETs answered `NotFound` so far (the reader re-asks a lost block on its backoff, so this keeps growing).
     pub not_found: u64,
@@ -74,7 +78,15 @@ pub struct Lose {
 
 impl Lose {
     pub fn new(target: Target, n: usize) -> Lose {
-        Lose { target, n, chosen: None, not_found: 0 }
+        Lose { target, n, domain: None, chosen: None, not_found: 0 }
+    }
+
+    /// [`Target::Data`], choosing the group of `domain`'s records by identity (see the field).
+    pub fn with_domain(mut self, domain: &str) -> Lose {
+        let mut marker = domain.as_bytes().to_vec();
+        marker.push(0);
+        self.domain = Some(marker);
+        self
     }
 
     pub fn chosen(&self) -> Option<&Chosen> {
@@ -93,7 +105,21 @@ impl Lose {
             if let Some((&kind::TREE_NODE, body)) = state.split_first() {
                 if let Ok(node) = Node::parse(body) {
                     let parity: Vec<Cid> = node.parity().collect();
-                    let group = group_members(&node).into_iter().enumerate().find(|(_, (_, m))| m.len() >= 2);
+                    // Each referenced value's key (a leaf's): what `--domain` matches a group's members by.
+                    let key_of: std::collections::BTreeMap<Cid, Vec<u8>> = (0..if node.is_leaf() { node.len() } else { 0 })
+                        .filter_map(|i| match node.value(i) {
+                            freenet_prolly::node::Value::Ref { cid, .. } => Some((cid, node.key(i))),
+                            freenet_prolly::node::Value::Inline(_) => None,
+                        })
+                        .collect();
+                    let domain = self.domain.clone();
+                    let fits = |m: &Vec<Cid>| match &domain {
+                        None => m.len() >= 2,
+                        Some(marker) => {
+                            node.is_leaf() && !m.is_empty() && m.iter().all(|c| key_of.get(c).is_some_and(|k| k.windows(marker.len()).any(|w| w == marker.as_slice())))
+                        }
+                    };
+                    let group = group_members(&node).into_iter().enumerate().find(|(_, (_, m))| fits(m));
                     if let Some((g, (_, members))) = group {
                         if let Some(par) = parity.get(PARITY * g..PARITY * (g + 1)) {
                             self.choose(members, par);
@@ -139,7 +165,10 @@ pub fn short(id: &Cid) -> String {
 /// THE LOG LINE for a group chosen (`group`: `"data"` or `"root"`). LOAD-BEARING: the realnet step's VOID check reads
 /// `lost` against the `not_found` lines ([`not_found_line`]); the shape is pinned by a test.
 pub fn chosen_line(group: &str, c: &Chosen) -> serde_json::Value {
-    serde_json::json!({ "chosen": group, "k": c.k, "slots": c.slots.len(), "lost": c.lost.iter().map(short).collect::<Vec<_>>() })
+    // `lost_data`: the lost DATA members (the first `k` slots): a read of them is a decode (the realnet step's
+    // non-vacuity check reads these).
+    let lost_data: Vec<String> = c.slots[..c.k].iter().filter(|s| c.lost.contains(*s)).map(short).collect();
+    serde_json::json!({ "chosen": group, "k": c.k, "slots": c.slots.len(), "lost": c.lost.iter().map(short).collect::<Vec<_>>(), "lost_data": lost_data })
 }
 
 /// THE LOG LINE for one GET answered NotFound. LOAD-BEARING (see [`chosen_line`]).
@@ -279,6 +308,42 @@ mod tests {
         }
     }
 
+    /// `--domain` chooses THE domain's group by IDENTITY (7c's realnet): a tree whose first group of `k >= 2` is not the
+    /// bulk rows' (small rows of another domain make the root a branch of leaves), and three referenced bulk values in
+    /// one leaf. Without `--domain` the first `k >= 2` group is chosen -- not theirs; with it, exactly the bulk values'.
+    #[test]
+    fn a_domain_chooses_its_records_group_whatever_the_trees_shape() {
+        let mut b = MemBlocks::default();
+        let empty = freenet_prolly::build::init(&mut b);
+        let key = |domain: &str, i: u32| [&[1u8][..], domain.as_bytes(), &[0], format!("{i:08}").as_bytes()].concat();
+        let mut edits: Vec<(Vec<u8>, Edit)> = (0..3000u32).map(|i| (key("notes", i), Edit::Put(vec![7u8; 40]))).collect();
+        edits.extend((0..3u32).map(|i| (key("bulk", i), Edit::Put(vec![b'x' + i as u8; 1400]))));
+        edits.sort_by(|a, b| a.0.cmp(&b.0));
+        let applied = apply_into(&mut b, &empty, &edits).expect("the tree");
+        // Feed the reader's walk: every node, parents first.
+        let walk = |mut l: Lose| -> Option<Chosen> {
+            let mut todo = vec![applied.root];
+            while let Some(id) = todo.pop() {
+                let bytes = b.get(&id).expect("held").to_vec();
+                let _ = l.block(id, &state(kind::TREE_NODE, &bytes));
+                if l.chosen().is_some() {
+                    return l.chosen().cloned();
+                }
+                let n = Node::parse(&bytes).expect("a node");
+                if !n.is_leaf() {
+                    todo.extend((0..n.len()).rev().map(|i| n.child(i).0));
+                }
+            }
+            None
+        };
+        let shape = walk(Lose::new(Target::Data, PARITY)).expect("THE SETUP: no group of k >= 2 at all");
+        let bulk = walk(Lose::new(Target::Data, PARITY).with_domain("bulk")).expect("--domain bulk chose no group");
+        assert_eq!(bulk.k, 3, "--domain bulk chose a group of k = {}, not the three bulk values", bulk.k);
+        assert_ne!(shape.slots, bulk.slots, "THE SETUP: the first k >= 2 group IS the bulk one, so this proves nothing");
+        let bulk_values: BTreeSet<Cid> = (0..3u32).map(|i| freenet_prolly::block_id(kind::RAW, &vec![b'x' + i as u8; 1400])).collect();
+        assert_eq!(bulk.slots[..bulk.k].iter().copied().collect::<BTreeSet<_>>(), bulk_values, "--domain chose other members");
+    }
+
     /// A leaf (no referenced values: no group) and a value block are never chosen as the data group.
     #[test]
     fn nothing_without_a_group_of_two_is_chosen() {
@@ -316,7 +381,7 @@ mod tests {
     fn the_log_lines_keep_their_shape() {
         let c = Chosen { slots: vec![[1; 32], [2; 32], [3; 32]], k: 2, lost: [[1; 32], [3; 32]].into_iter().collect() };
         let chosen = chosen_line("data", &c);
-        assert_eq!(chosen, serde_json::json!({ "chosen": "data", "k": 2, "slots": 3, "lost": ["0101010101010101", "0303030303030303"] }));
+        assert_eq!(chosen, serde_json::json!({ "chosen": "data", "k": 2, "slots": 3, "lost": ["0101010101010101", "0303030303030303"], "lost_data": ["0101010101010101"] }));
         let nf = not_found_line(&[3; 32], 7);
         assert_eq!(nf, serde_json::json!({ "not_found": "0303030303030303", "not_found_total": 7 }));
         // The ids the two lines name for one block are the SAME string.

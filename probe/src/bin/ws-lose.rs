@@ -19,13 +19,21 @@ use std::sync::{Arc, Mutex};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    const USAGE: &str = "usage: ws-lose <listen-port> <node-ws-port> --group data|root --lose m|m+1";
+    const USAGE: &str = "usage: ws-lose <listen-port> <node-ws-port> --group data|root --lose m|m+1 [--domain <name>]";
     let a: Vec<String> = std::env::args().skip(1).collect();
-    let [listen, node, g, group, l, lose] = a.as_slice() else { bail!(USAGE) };
-    if g != "--group" || l != "--lose" {
-        bail!(USAGE);
-    }
+    let (listen, node, group, lose, domain) = match a.as_slice() {
+        [listen, node, g, group, l, lose] if g == "--group" && l == "--lose" => (listen, node, group, lose, None),
+        [listen, node, g, group, l, lose, d, domain] if g == "--group" && l == "--lose" && d == "--domain" => (listen, node, group, lose, Some(domain)),
+        _ => bail!(USAGE),
+    };
     let (target, n) = (Target::parse(group)?, parse_lose(lose)?);
-    let said = serde_json::json!({ "group": group, "lose": n });
-    serve(listen.parse()?, node.parse()?, said, Arc::new(LoseHooks(Mutex::new(Lose::new(target, n))))).await
+    if domain.is_some() && target != Target::Data {
+        bail!("--domain chooses a DATA group: {USAGE}");
+    }
+    let said = serde_json::json!({ "group": group, "lose": n, "domain": domain });
+    let mut l = Lose::new(target, n);
+    if let Some(d) = domain {
+        l = l.with_domain(d);
+    }
+    serve(listen.parse()?, node.parse()?, said, Arc::new(LoseHooks(Mutex::new(l)))).await
 }
