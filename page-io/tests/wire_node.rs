@@ -3386,6 +3386,7 @@ fn an_upgrade_keeps_the_link_and_the_pointer_byte_for_byte() {
         webs.push(node.site().expect("live").2);
     }
     assert_eq!(webs, vec![site_web(&node, APP, 1), site_web(&node, APP, 2)], "an upgrade's site is not its starter and the SAME pointer");
+}
 
 /// Every row of `io`'s tree, read through the normal read: a full range, page by page (the engine's scan).
 fn read_all(io: &mut PageIo, node: &mut WireNode, now: &mut u64, base: u64) -> usize {
