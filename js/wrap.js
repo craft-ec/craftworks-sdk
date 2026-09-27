@@ -1,5 +1,5 @@
 import { openSession, open as openWith, openAsked as openAskedWith, SHIPPED_ARTEFACTS } from "./session.js";
-import { engineDb, sameRows } from "./engine-db.js";
+import { engineDb, sameRows, BINDING } from "./engine-db.js";
 
 // Plain-object API over the wasm surface. `raw` is the wasm-bindgen module.
 //
@@ -8,6 +8,22 @@ import { engineDb, sameRows } from "./engine-db.js";
 //   const t = db.put("tasks", { title: "hello" });      // → { id, created, updated, fields }
 //   db.scan("tasks", { reverse: true, limit: 50 });     // → [records]
 export function wrap(raw) {
+  // THE STATUS VOCABULARY (sdk#518), built from its owners on first read and kept: each group keyed by its word
+  // upper-cased (`"nokey"` -> `NOKEY`, `"ROLLED_BACK"` -> `ROLLED_BACK`), each frozen.
+  let status;
+  const statusWords = () => {
+    const group = words => Object.freeze(Object.fromEntries(words.map(w => [w.toUpperCase(), w])));
+    const said = JSON.parse(raw.status_words());
+    return Object.freeze({
+      row: group(said.rowState),
+      put: group(said.putStatus),
+      site: group(said.siteStatus),
+      canWrite: group(said.canWrite),
+      asked: group(said.asked),
+      binding: BINDING,
+    });
+  };
+
   class Db {
     #db = new raw.Db();
 
@@ -118,7 +134,7 @@ export function wrap(raw) {
     // able to tell which backend it has from what a call returns (sdk#87),
     // and a component that branched on `status()` existing would work in a
     // preview and throw once published.
-    #status = { state: "loading", why: "", code: "" };
+    #status = { state: BINDING.LOADING, why: "", code: "" };
     constructor(db, domain, live, limit = 0, reverse = false, parent = null) {
       this.#db = db; this.#domain = domain; this.#live = live; this.#limit = limit; this.#reverse = reverse;
       this.#parent = parent;
@@ -166,8 +182,8 @@ export function wrap(raw) {
         : await this.#db.scan(this.#domain, { limit: this.#limit, reverse: this.#reverse });
       this.#root = root;
       const was = this.#status.state;
-      this.#status = { state: "ready", why: "", code: "" };
-      if (was !== "ready" && sameRows(this.#rows, rows)) {
+      this.#status = { state: BINDING.READY, why: "", code: "" };
+      if (was !== BINDING.READY && sameRows(this.#rows, rows)) {
         // Rows unchanged, STATE changed: the first load of an empty domain
         // moves `loading` to `ready`, and a component watching only the rows
         // would sit on "loading" for ever.
@@ -230,6 +246,11 @@ export function wrap(raw) {
     rowSaved: code => raw.row_saved(String(code ?? "")),
     rowBackedUp: code => raw.row_backed_up(String(code ?? "")),
     rowStates: () => [...raw.row_states()],
+    rowLost: code => raw.row_lost(String(code ?? "")),
+    // THE STATUS VOCABULARY (sdk#518), ONE list: every word each status method answers, BUILT from the Rust owner
+    // (`status_words`) and the binding's JS owner (`BINDING`) -- no copy here to drift. `status.put.PENDING ===
+    // "pending"`; each group frozen, so a word cannot be added or respelled at a call site.
+    get status() { return (status ??= statusWords()); },
     SHIPPED_ARTEFACTS,
     // PUBLISHING a web container (builder#104): `params(state)` is the
     // `webapp` contract's params (BLAKE3, which a page has no other way to

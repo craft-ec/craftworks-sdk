@@ -99,6 +99,13 @@ const equal = (a, b) => {
  * The cost is one walk of rows that `scan` has just `JSON.parse`d — the same
  * order of work, already paid once per reload.
  */
+/**
+ * A BINDING'S STATUS WORDS (sdk#518), their one owner: what `binding.status().state` can be, for every binding the
+ * SDK makes -- a node's (here) and the in-page database's (`wrap.js`). An app compares against these
+ * (`sdk.status.binding`), never a literal of its own.
+ */
+export const BINDING = Object.freeze({ LOADING: "loading", READY: "ready", UNREACHABLE: "unreachable" });
+
 export const sameRows = (a, b) => {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (!equal(a[i], b[i])) return false;
@@ -457,7 +464,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       // `loading` until the first reload finishes, then `ready` or
       // `unreachable`. Empty is not a state here: it is `ready` with no rows,
       // which is exactly what makes it PROVABLE.
-      let status = { state: "loading", why: "", code: "" };
+      let status = { state: BINDING.LOADING, why: "", code: "" };
       const listeners = new Set();
       const b = {
         get live() { return live; },
@@ -568,7 +575,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
             // and no one could see that the read had failed.
             const was = status;
             status = {
-              state: "unreachable",
+              state: BINDING.UNREACHABLE,
               why: String(e?.message ?? e),
               code: String(e?.code ?? ""),
             };
@@ -592,7 +599,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
           }
           root = self.root();
           const was = status;
-          status = { state: "ready", why: "", code: "" };
+          status = { state: BINDING.READY, why: "", code: "" };
           if (sameRows(rows, next)) {
             // The ROWS did not change but the STATUS may have: a range that
             // was unreachable and is now readable-and-empty is a different

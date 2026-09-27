@@ -73,60 +73,50 @@ pub enum Delta {
     /// was away a while.
     FullReloadRequired { new_root: [u8; 32] },
 }
-
-/// Reading, which for some stores is a ROUND TRIP.
-///
-/// Separate from [`Store`], and taking `&mut self`, and both are the same
-/// decision. An engine-backed store's data is on the other side of a
-/// connection: a read is an operation with a duration, not an accessor. A
-/// `&self` read would have to hide interior mutability — making a network
-/// round trip look free — or answer `None`, which says the key does not
-/// exist, or panic, which in a browser with `panic = abort` is a dead wasm
-/// instance rather than something an app can catch.
-///
-/// `&mut self` says so in the type, and it says so for every backend, which
-/// is what lets one surface sit over both: the in-memory store implements
-/// this trivially and an app does not change when it moves onto a node.
-/// What a record's OWN write is doing.
-///
-/// A fixed set of codes and never prose: a row branches on this to decide
-/// whether it may say "saved", and a caller that matched on a message would
-/// change behaviour the first time anybody reworded it, silently.
-///
-/// The distinction a person actually needs is the middle one. "Saving",
-/// "saved here but not yet on the network" and "on the network" are three
-/// different facts, and somebody deciding whether it is safe to close the tab
-/// needs the second told apart from the third.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RowState {
-    /// No pending write: this is what the engine last said.
-    #[default]
-    Clean,
-    /// Written here and not sent yet — the engine was busy with another.
-    Queued,
-    /// Sent and accepted, not yet published. **Closing the tab now loses it.**
-    Pending,
-    /// A write that was rolled back: it failed, or nothing ever answered it.
-    RolledBack,
-    /// Saved, AND its redundancy is on the network: the commit of the key's
-    /// last write is BACKED_UP -- every group it changed whole (sdk#415, rule
-    /// 10; READ-STATE `key_state`'s `SavedAndBackedUp`, the one owner). What
-    /// the builder's "saved + backed up" chip shows.
-    BackedUp,
+crate::status::vocabulary! {
+    /// Reading, which for some stores is a ROUND TRIP.
+    ///
+    /// Separate from [`Store`], and taking `&mut self`, and both are the same
+    /// decision. An engine-backed store's data is on the other side of a
+    /// connection: a read is an operation with a duration, not an accessor. A
+    /// `&self` read would have to hide interior mutability — making a network
+    /// round trip look free — or answer `None`, which says the key does not
+    /// exist, or panic, which in a browser with `panic = abort` is a dead wasm
+    /// instance rather than something an app can catch.
+    ///
+    /// `&mut self` says so in the type, and it says so for every backend, which
+    /// is what lets one surface sit over both: the in-memory store implements
+    /// this trivially and an app does not change when it moves onto a node.
+    /// What a record's OWN write is doing.
+    ///
+    /// A fixed set of codes and never prose: a row branches on this to decide
+    /// whether it may say "saved", and a caller that matched on a message would
+    /// change behaviour the first time anybody reworded it, silently.
+    ///
+    /// The distinction a person actually needs is the middle one. "Saving",
+    /// "saved here but not yet on the network" and "on the network" are three
+    /// different facts, and somebody deciding whether it is safe to close the tab
+    /// needs the second told apart from the third.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum RowState {
+        /// No pending write: this is what the engine last said.
+        #[default]
+        Clean => "CLEAN",
+        /// Written here and not sent yet — the engine was busy with another.
+        Queued => "QUEUED",
+        /// Sent and accepted, not yet published. **Closing the tab now loses it.**
+        Pending => "PENDING",
+        /// A write that was rolled back: it failed, or nothing ever answered it.
+        RolledBack => "ROLLED_BACK",
+        /// Saved, AND its redundancy is on the network: the commit of the key's
+        /// last write is BACKED_UP -- every group it changed whole (sdk#415, rule
+        /// 10; READ-STATE `key_state`'s `SavedAndBackedUp`, the one owner). What
+        /// the builder's "saved + backed up" chip shows.
+        BackedUp => "BACKED_UP",
+}
 }
 
 impl RowState {
-    /// The stable code that crosses the boundary.
-    pub fn code(self) -> &'static str {
-        match self {
-            RowState::Clean => "CLEAN",
-            RowState::Queued => "QUEUED",
-            RowState::Pending => "PENDING",
-            RowState::RolledBack => "ROLLED_BACK",
-            RowState::BackedUp => "BACKED_UP",
-        }
-    }
-
     /// Whether a row showing this value may claim to be saved.
     ///
     /// An invariant, not a convenience: a row showing an unacknowledged value
@@ -140,16 +130,10 @@ impl RowState {
         self == RowState::BackedUp
     }
 
-    /// Every state a row can report, in one list: what an app that labels
-    /// states checks itself against, so a state added here cannot reach a
-    /// person unlabelled (the builder's publish stalled on `BACKED_UP`, which
-    /// its own copy of this vocabulary did not have).
-    pub const ALL: [RowState; 5] =
-        [RowState::Clean, RowState::Queued, RowState::Pending, RowState::RolledBack, RowState::BackedUp];
-
-    /// The state a code names; `None` for a code this build does not know.
-    pub fn from_code(code: &str) -> Option<RowState> {
-        RowState::ALL.into_iter().find(|s| s.code() == code)
+    /// Lost: the write was rolled back -- it failed, or nothing ever answered it -- and its value is not in the tree
+    /// (sdk#518).
+    pub fn is_lost(self) -> bool {
+        self == RowState::RolledBack
     }
 }
 

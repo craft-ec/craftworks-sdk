@@ -16,6 +16,7 @@ pub mod page_store;
 pub mod read_token;
 pub mod record;
 pub mod schema;
+pub mod status;
 pub mod store;
 pub mod tick_gate;
 pub mod trace;
