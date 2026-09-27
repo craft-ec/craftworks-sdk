@@ -59,6 +59,11 @@ fn a_get_answer_names_its_contract_from_its_head() {
     assert_eq!(wire::get_key_prefix(b"garbage"), None);
 }
 
+// The bounds' arithmetic, checked when this compiles: the read state and its envelope ARE the one bound, a site's
+// web fits inside the read state, and the bound covers freenet's 50 MiB MAX_STATE_SIZE.
+const _: () = assert!(wire::MAX_READ_STATE + wire::READ_ENVELOPE == wire::MAX_REASSEMBLED);
+const _: () = assert!(wire::MAX_SITE_WEB < wire::MAX_READ_STATE && wire::MAX_REASSEMBLED >= 50 * 1024 * 1024);
+
 /// THE ONE BOUND'S ENVELOPE: a GET answer's encoding adds at most `READ_ENVELOPE` to its state, so a state of
 /// `MAX_READ_STATE` is a message of at most `MAX_REASSEMBLED` -- one this page reads.
 #[test]
@@ -66,8 +71,6 @@ fn a_state_of_max_read_state_is_a_message_this_page_reads() {
     let (_, bytes) = get_answer(vec![0u8; 4096]);
     let envelope = bytes.len() - 4096;
     assert!(envelope <= wire::READ_ENVELOPE, "a GET answer's envelope is {envelope} bytes, over READ_ENVELOPE");
-    assert_eq!(wire::MAX_READ_STATE + wire::READ_ENVELOPE, wire::MAX_REASSEMBLED);
-    assert!(wire::MAX_SITE_WEB < wire::MAX_READ_STATE && wire::MAX_REASSEMBLED >= 50 * 1024 * 1024, "the bound does not cover freenet's 50 MiB state");
 }
 
 /// A GET ANSWERED TOO LARGE IS NAMED (rule 8): one frame over `MAX_FRAME` (a node chunks anything larger, so this is
