@@ -538,6 +538,8 @@ pub struct RepairReport {
     pub given_up: u64,
     /// Parity re-encoded to an id its parent does not list: never PUT.
     pub parity_mismatched: u64,
+    /// Repair PUTs sent and not answered yet (the node's word still owed).
+    pub pending: u64,
     /// Why the last group was given up.
     pub why: Option<String>,
 }
@@ -2742,6 +2744,7 @@ impl Page {
             rejected: self.repairs_rejected,
             given_up: self.engine.repair_counts().2,
             parity_mismatched: self.engine.parity_counts().2,
+            pending: self.repair_puts.iter().filter(|id| !self.repairs_acked.contains(*id)).count() as u64,
             why: self.engine.repair_failed().map(str::to_string),
         }
     }

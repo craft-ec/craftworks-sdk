@@ -22,6 +22,7 @@ export function wrap(raw) {
       canWrite: group(said.canWrite),
       asked: group(said.asked),
       groupHealth: group(said.groupHealth),
+      repairOutcome: group(said.repairOutcome),
       binding: BINDING,
     });
   };

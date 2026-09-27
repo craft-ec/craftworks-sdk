@@ -154,6 +154,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
   // QUEUE_FULL by the engine too (it holds the session until its queue is
   // empty), so it waits behind them: order within the session holds.
   let roomWaiters = [];
+  // A running repairAll's stop (sdk#479): checked between its pages and while it waits for its put-backs' answers.
+  let repairCancelled = false;
   const wakeRoom = () => {
     const w = roomWaiters;
     roomWaiters = [];
@@ -456,6 +458,38 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     // rather than answering an empty list (craftworks-sdk#122).
     children: (domain, parent, { reverse = false, limit = 0, after = "" } = {}) =>
       once(() => JSON.parse(session.children(domain, parent, reverse, limit, after))),
+
+    /**
+     * REPAIR (sdk#479): read the WHOLE tree -- every key of every app -- through the normal read, which rebuilds a
+     * block the node lost from any `k` of its group, re-encodes a lost parity block with the save's own code, and PUTs
+     * both back; then wait for those PUTs' answers, and resolve with the session's report: `outcome` a word of
+     * `sdk.status.repairOutcome`, the counts (`missing`, `putBack`, `rejected`, `givenUp`, `parityMismatched`,
+     * `pending`), each `damaged` group with its `sdk.status.groupHealth` word, `why`, and the `rows` read.
+     *
+     * Run it on a session whose store is COLD for the tree (a fresh reader of it): a page that already holds a block
+     * serves it from memory and never asks the node, so a warm page finds nothing missing. `repairAllCancel()` stops
+     * it; it then resolves with outcome `cancelled` and the counts so far.
+     */
+    async repairAll({ limit = 500 } = {}) {
+      repairCancelled = false;
+      let after = "";
+      let rows = 0;
+      while (!repairCancelled) {
+        const page = await once(() => JSON.parse(session.scan_all(after, limit)));
+        rows += page.rows;
+        if (page.next == null) break;
+        after = page.next;
+      }
+      // The put-backs are answered on the session's own wake (every message it handled, and its tick): no timer.
+      while (!repairCancelled && JSON.parse(session.repair_report(false)).pending > 0) {
+        await new Promise(resolve => roomWaiters.push(resolve));
+      }
+      return { rows, ...JSON.parse(session.repair_report(repairCancelled)) };
+    },
+    repairAllCancel() {
+      repairCancelled = true;
+      wakeRoom();
+    },
 
     /**
      * A BINDING: one domain, as a component consumes it.

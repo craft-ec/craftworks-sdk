@@ -27,7 +27,7 @@
 //! of 2026-09-23 was one of them going stale. The one head-shaped fact kept
 //! here is each LIVE binding's `RenderedAt`, which only the binding can know.
 
-use craftworks_sdk::status::{AppPublishStatus, AskedState, CanWrite, PutStatus, SiteStatus};
+use craftworks_sdk::status::{AppPublishStatus, AskedState, CanWrite, PutStatus, RepairOutcome, SiteStatus};
 use craftworks_sdk::{DbError, Outcome, PageStore, SystemEnv};
 use page_io::PageIo;
 use wasm_bindgen::prelude::*;
@@ -660,6 +660,44 @@ impl Session {
         p.site_link(&code, app).ok_or_else(|| {
             JsValue::from_str(&if p.register_params_known() { format!("no site link for {app:?}: not an app id, or this head has no single key") } else { page_io::NO_REGISTER_YET.to_string() })
         })
+    }
+
+    /// ONE PAGE of a whole-tree read for REPAIR (sdk#479): `{"rows", "next"}`, `next` the hex key to pass back as
+    /// `after` (`null` when the tree is read). A NOT_LOADED is a ticket like every read (`once` in js/engine-db.js).
+    pub fn scan_all(&mut self, after: &str, limit: usize) -> Result<String, JsValue> {
+        let after = if after.is_empty() { None } else { Some(hex::decode(after).map_err(|e| JsValue::from_str(&format!("after is not hex: {e}")))?) };
+        let r = self.db.scan_all(after, limit).map(|(rows, next)| serde_json::json!({ "rows": rows, "next": next.map(hex::encode) }));
+        self.answer(r)
+    }
+
+    /// REPAIR's report (sdk#479), as JSON: what this session's reads found missing on the node and put back since it
+    /// opened -- `{"outcome", "missing", "putBack", "rejected", "givenUp", "parityMismatched", "pending", "damaged":[{"block",
+    /// "present", "k", "health"}], "why"}`. `outcome` is a word of `sdk.status.repairOutcome` (`RepairOutcome::of`,
+    /// the one derivation; `cancelled` says the pass was stopped), each `health` one of `sdk.status.groupHealth`.
+    /// `repairAll` (js/engine-db.js) reads the whole tree through the normal read, then asks this.
+    pub fn repair_report(&self, cancelled: bool) -> String {
+        let Some(p) = self.page() else {
+            return serde_json::json!({ "outcome": RepairOutcome::of(0, 0, 0, 0, cancelled).code(), "missing": 0, "putBack": 0, "rejected": 0, "givenUp": 0, "parityMismatched": 0, "pending": 0, "damaged": [], "why": null }).to_string();
+        };
+        let r = p.repair_report();
+        let damaged: Vec<serde_json::Value> = p
+            .damaged()
+            .iter()
+            .map(|d| serde_json::json!({ "block": engine::short_id(&d.block), "present": d.j, "k": d.k, "health": engine::repair::GroupHealth::Damaged.code() }))
+            .collect();
+        let outcome = RepairOutcome::of(r.missing, r.put_back, r.rejected, r.given_up + damaged.len() as u64, cancelled);
+        serde_json::json!({
+            "outcome": outcome.code(),
+            "missing": r.missing,
+            "putBack": r.put_back,
+            "rejected": r.rejected,
+            "givenUp": r.given_up,
+            "parityMismatched": r.parity_mismatched,
+            "pending": r.pending,
+            "damaged": damaged,
+            "why": r.why,
+        })
+        .to_string()
     }
 
     /// How `app`'s site publication stands, as JSON

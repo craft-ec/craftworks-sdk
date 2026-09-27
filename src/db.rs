@@ -1058,6 +1058,20 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             .collect()
     }
 
+    /// ONE PAGE OF THE WHOLE TREE, every key of every app (sdk#479, REPAIR): up to `limit` rows after `after`, read
+    /// through the normal read -- which races each block's group and puts back what the node lost. Returns how many
+    /// rows it read and where the next page starts (`None`: the tree is read). Rows are counted, never decoded: a
+    /// repair pass needs every block walked, not the records.
+    pub fn scan_all(&mut self, after: Option<Vec<u8>>, limit: usize) -> Result<(usize, Option<Vec<u8>>)> {
+        let lo = after.map(|k| [k, vec![0]].concat()).unwrap_or_default();
+        // Past every key: a key is at most MAX_KEY bytes, so MAX_KEY + 1 of 0xff sorts after all of them.
+        let hi = vec![0xff; MAX_KEY + 1];
+        let limit = limit.max(1);
+        let rows = self.scan_keys(&lo, &hi, false, limit)?;
+        let next = (rows.len() == limit).then(|| rows.last().map(|(k, _)| k.clone())).flatten();
+        Ok((rows.len(), next))
+    }
+
     /// THE CHILDREN OF ONE PARENT, as a bounded read.
     ///
     /// The app names the parent; it never builds a range. What the range IS

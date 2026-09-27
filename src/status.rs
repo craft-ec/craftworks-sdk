@@ -70,8 +70,40 @@ vocabulary! {
     }
 }
 
+vocabulary! {
+    /// How a whole-tree REPAIR pass ended (`Session::repair_report`'s `outcome`, sdk#479): HEALTHY nothing was missing;
+    /// REPAIRED everything missing was put back; PARTIAL some is not back yet; DAMAGED a group could not be solved;
+    /// CANCELLED the pass was stopped (its counts are what it did).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RepairOutcome {
+        Healthy => "healthy",
+        Repaired => "repaired",
+        Partial => "partial",
+        Damaged => "damaged",
+        Cancelled => "cancelled",
+    }
+}
+
+impl RepairOutcome {
+    /// THE one derivation of a pass's word from its numbers (the tab only labels it). DAMAGED wins over everything but
+    /// a cancel: a group no read could solve is lost data, whatever else was put back.
+    pub fn of(missing: u64, put_back: u64, rejected: u64, damaged: u64, cancelled: bool) -> RepairOutcome {
+        if cancelled {
+            RepairOutcome::Cancelled
+        } else if damaged > 0 {
+            RepairOutcome::Damaged
+        } else if missing == 0 {
+            RepairOutcome::Healthy
+        } else if rejected == 0 && put_back >= missing {
+            RepairOutcome::Repaired
+        } else {
+            RepairOutcome::Partial
+        }
+    }
+}
+
 /// Every list, as the JSON `status_words` exports: `{"rowState":[..], "putStatus":[..], "siteStatus":[..],
-/// "appPublishStatus":[..], "canWrite":[..], "asked":[..], "groupHealth":[..]}` (the last the engine's, sdk#524).
+/// "appPublishStatus":[..], "canWrite":[..], "asked":[..], "groupHealth":[..], "repairOutcome":[..]}` (groupHealth the engine's, sdk#524).
 pub fn words() -> serde_json::Value {
     fn list<T: Copy>(all: &[T], code: fn(T) -> &'static str) -> Vec<&'static str> {
         all.iter().map(|w| code(*w)).collect()
@@ -84,6 +116,7 @@ pub fn words() -> serde_json::Value {
         "canWrite": list(&CanWrite::ALL, CanWrite::code),
         "asked": list(&AskedState::ALL, AskedState::code),
         "groupHealth": list(&engine::repair::GroupHealth::ALL, engine::repair::GroupHealth::code),
+        "repairOutcome": list(&RepairOutcome::ALL, RepairOutcome::code),
     })
 }
 
@@ -96,7 +129,7 @@ mod tests {
     #[test]
     fn words_is_every_enum_s_all_each_word_once() {
         let v = words();
-        let want: [(&str, Vec<&str>); 7] = [
+        let want: [(&str, Vec<&str>); 8] = [
             ("rowState", RowState::ALL.iter().map(|w| w.code()).collect()),
             ("putStatus", PutStatus::ALL.iter().map(|w| w.code()).collect()),
             ("siteStatus", SiteStatus::ALL.iter().map(|w| w.code()).collect()),
@@ -104,6 +137,7 @@ mod tests {
             ("canWrite", CanWrite::ALL.iter().map(|w| w.code()).collect()),
             ("asked", AskedState::ALL.iter().map(|w| w.code()).collect()),
             ("groupHealth", engine::repair::GroupHealth::ALL.iter().map(|w| w.code()).collect()),
+            ("repairOutcome", RepairOutcome::ALL.iter().map(|w| w.code()).collect()),
         ];
         assert_eq!(v.as_object().map(|o| o.len()), Some(want.len()), "words() carries a list no enum owns: {v}");
         for (name, list) in want {
@@ -129,6 +163,7 @@ mod tests {
         round(&CanWrite::ALL, CanWrite::code, CanWrite::from_code);
         round(&AskedState::ALL, AskedState::code, AskedState::from_code);
         round(&engine::repair::GroupHealth::ALL, engine::repair::GroupHealth::code, engine::repair::GroupHealth::from_code);
+        round(&RepairOutcome::ALL, RepairOutcome::code, RepairOutcome::from_code);
     }
 
     /// Lost is the rolled-back state, and nothing else.
@@ -137,5 +172,18 @@ mod tests {
         for s in RowState::ALL {
             assert_eq!(s.is_lost(), s == RowState::RolledBack, "{}", s.code());
         }
+    }
+
+    /// Each outcome, and the order the rules decide in (cancel > damaged > healthy > repaired > partial).
+    #[test]
+    fn a_repair_outcome_is_derived_in_one_order() {
+        use RepairOutcome::*;
+        assert_eq!(RepairOutcome::of(0, 0, 0, 0, false), Healthy);
+        assert_eq!(RepairOutcome::of(3, 3, 0, 0, false), Repaired);
+        assert_eq!(RepairOutcome::of(3, 2, 0, 0, false), Partial);
+        assert_eq!(RepairOutcome::of(3, 3, 1, 0, false), Partial, "a refused put-back is not repaired");
+        assert_eq!(RepairOutcome::of(3, 3, 0, 1, false), Damaged, "a damaged group wins over put-backs");
+        assert_eq!(RepairOutcome::of(3, 3, 0, 1, true), Cancelled, "a cancel wins over everything");
+        assert_eq!(RepairOutcome::of(0, 0, 0, 0, true), Cancelled);
     }
 }
