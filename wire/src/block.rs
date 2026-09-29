@@ -41,27 +41,6 @@ pub fn block_contract(code: &[u8], cid: &Cid) -> ContractContainer {
     )))
 }
 
-/// The Block contract's STATE for a block: `kind ‖ body`, with the kind
-/// RECOVERED by trying every kind in the one list ([`BlockKind::ALL`](core_types::kind::BlockKind::ALL)) — one
-/// BLAKE3 pass each, and exact, because the id is a hash over the kind byte and only the right one can match.
-/// `None`: the id does not hash these bytes under any kind, and the contract would refuse it.
-pub fn block_state(id: &Cid, body: &[u8]) -> Option<Vec<u8>> {
-    for k in core_types::kind::BlockKind::ALL.map(|k| k.byte()) {
-        if freenet_prolly::block_id(k, body) == *id {
-            let mut v = Vec::with_capacity(1 + body.len());
-            v.push(k);
-            v.extend_from_slice(body);
-            return Some(v);
-        }
-    }
-    None
-}
-
-/// The inverse, for a GET answer: a Block contract's state is `kind ‖ body`,
-/// and the block id it holds is computed from it, never looked up — a state
-/// that hashes to something nobody asked for is caught by the caller's
-/// verify-by-id rather than trusted because a map said so.
-pub fn block_of_state(state: &[u8]) -> Option<(Cid, &[u8])> {
-    let (&kind, body) = state.split_first()?;
-    Some((freenet_prolly::block_id(kind, body), body))
-}
+/// The Block contract's STATE for a block (`kind ‖ body`), and its inverse: sans-IO, so their ONE home is
+/// `contract_keys::block` (a delegate reads and writes blocks too); re-exported here.
+pub use contract_keys::block::{block_of_state, block_state};
