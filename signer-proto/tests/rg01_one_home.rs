@@ -2,7 +2,7 @@
 //! state or params are READ only by the Register crate (`craftec-register-contract`: `read`, `wire::record_head`),
 //! the code every node validates with. The RG01 magic or a hand-written piece of its layout anywhere else in the
 //! workspace's non-test sources fails this test, so a new copy cannot merge (the copy it replaces refused a state
-//! with fork evidence, F56). ONE writer is excepted, counted exactly and printed: `wire::register_params` (the crate
+//! with fork evidence, F56). ONE writer is excepted, counted exactly and printed: `contract_keys::register_params` (re-exported by `wire`) (the crate
 //! parses params but has no encoder; `wire/tests/register_params.rs` round-trips it through the crate's parser).
 //!
 //! Test sources are not scanned: they build hostile and foreign states ON PURPOSE (a forged record, known-answer
@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 /// The one writer, and the exact number of its lines this scan matches.
-const EXCEPT: &[(&str, usize)] = &[("wire/src/lib.rs", 1)];
+const EXCEPT: &[(&str, usize)] = &[("contract-keys/src/lib.rs", 1)];
 
 /// A line that names the Register's magic or lays out its format by hand (a TRIPWIRE for the shapes known so far,
 /// each with a control line below).
